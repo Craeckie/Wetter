@@ -29,11 +29,23 @@ private const val WEATHER_URL = "https://kachelmannwetter.com/de/wetter/2892794-
 // Elements to strip from the page, carried over from the equivalent uBlock Origin
 // cosmetic filters (kachelmannwetter.com##...).
 private val HIDE_SELECTORS = listOf(
+    // Annoyances / overlays.
     "#countrydetection",
     "div.weather-infos",
     ".geonames-info",
     ".alert-dismissible.alert-default.alert",
     "div.md-mob-margin.mdcss-mobile",
+    // Ad slots. These reserve layout height even when no ad loads (none does in
+    // this WebView), so leaving them in shows up as large empty bands -- most
+    // visibly the top "billboard" margin. Selectors from the maintained public
+    // lists: uBlock uAssets (dkpw-billboard-margin*, kw-ad-right, #meteosafe,
+    // pflotsh promo) and EasyList Germany (.dkpw).
+    ".dkpw-billboard-margin",
+    ".dkpw-billboard-margin-fixed",
+    ".dkpw",
+    ".kw-ad-right",
+    "#meteosafe",
+    "[href=\"https://pflotsh.com\"]",
 )
 
 private val HIDE_CSS =
