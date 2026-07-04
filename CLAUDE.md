@@ -49,6 +49,42 @@ app/src/main/java/com.example.wetter/
 - **Networking:** add OkHttp + Retrofit or Ktor.
 - **DI:** if the app grows large, migrate to the `android-compose` template which includes Hilt.
 
+## Debugging the WebView (scroll/consent issues)
+
+`MainActivity.kt` embeds the target site in a `WebView` and injects a couple of JS/CSS
+workarounds on every page load:
+
+- `INJECT_HIDE_STYLE_JS` — hides a few page elements (cosmetic, carried over from uBlock filters).
+- `UNLOCK_SCROLL_JS` — counters a scroll-lock bug: the site's consent-management script
+  (SourcePoint) sets `body { position: fixed; overflow: hidden }` inline via
+  `style.setProperty(..., 'important')` while showing its consent dialog, then never releases
+  it in this WebView (the dialog doesn't render), leaving the page permanently frozen. A
+  stylesheet `!important` rule can't win that fight — inline `!important` always beats
+  stylesheet `!important` for the same element — so instead a `MutationObserver` watches
+  `body`'s inline style and re-asserts our own inline `!important` override every time the
+  site (re-)locks it.
+
+If scrolling (or similar page-behavior) breaks again, capture a log and run it through the
+analyzer:
+
+1. On the device: Settings → enable Developer options → **Bug report** (or `adb bugreport`),
+   or just `adb logcat -v threadtime > log.txt` while reproducing the issue. The in-app
+   "share log" flow (dev options → take bug report → share) works too.
+2. Analyze it:
+   ```bash
+   python3 scripts/analyze_log.py path/to/log.txt
+   ```
+   It reports: which WebView engine rendered the page, any consent-management (CMP) script
+   activity, a scroll-state timeline (only present if the app was a **debug** build — see
+   below), chromium console warnings/errors, crashes/ANRs, and enabled accessibility services
+   flagged if they could intercept touch/scroll.
+3. Debug builds also install `SCROLL_WATCH_JS`, which logs a snapshot (`__wetter_scroll_watch__`
+   in logcat) every time the page's scrollability or `body`'s position/overflow changes — this
+   is what the analyzer's "Scroll state timeline" section reads. Release builds skip it.
+4. Debug builds also call `WebView.setWebContentsDebuggingEnabled(true)`, so the live page can
+   be inspected directly via `chrome://inspect#devices` on a computer with the phone connected
+   over USB.
+
 ## Local release (optional)
 
 This template ships with CI signing but **no local release script** (the `android-compose`

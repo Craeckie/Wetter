@@ -54,6 +54,66 @@ private val INJECT_HIDE_STYLE_JS = """
     })();
 """.trimIndent()
 
+// The page's consent-management script (SourcePoint) locks background scroll by setting
+// `body { position: fixed; overflow: hidden }` inline via style.setProperty(..., 'important')
+// while its consent dialog is shown, then restores it once dismissed. In this WebView the
+// lock gets applied but the matching dialog never renders, so the release never fires and
+// the page is stuck unscrollable. A stylesheet rule can't out-rank that: an inline
+// !important declaration always wins over a stylesheet !important declaration for the same
+// element, regardless of selector. So instead we reassert our own inline !important override
+// in JS -- inline vs. inline is decided by whoever set it last, so re-applying after the lock
+// wins. Scoped to just these two properties on body itself, so legitimate fixed/sticky
+// elements elsewhere on the page are unaffected.
+//
+// Reasserting is driven by two things:
+//   1. A MutationObserver on body's inline style -- catches the lock whenever it lands.
+//   2. A bounded requestAnimationFrame loop for the first few seconds after injection.
+// The observer alone is racy: the lock arrives ~0.5s after onPageFinished, and depending on
+// timing the observer would sometimes only react to a *later* unrelated body mutation (or not
+// until the page was reloaded), leaving scroll frozen for seconds. The rAF loop closes that
+// window -- worst-case latency becomes one frame -- and covers the case where the observer
+// misses the exact lock mutation (e.g. body being replaced). It stops after UNLOCK_WINDOW_MS
+// since the orphaned consent lock only ever lands right after load; the observer stays on for
+// anything later.
+private const val UNLOCK_WINDOW_MS = 8000
+private val UNLOCK_SCROLL_JS = """
+    (function() {
+        if (window.__wetterUnlockScrollInstalled) { return; }
+        window.__wetterUnlockScrollInstalled = true;
+        function unlock() {
+            var body = document.body;
+            if (!body) { return; }
+            var bs = getComputedStyle(body);
+            if (bs.position === 'fixed' || bs.overflowY === 'hidden') {
+                body.style.setProperty('position', 'static', 'important');
+                body.style.setProperty('overflow', 'visible', 'important');
+                // Debug-only breadcrumb so scripts/analyze_log.py can confirm the unlock
+                // fired and measure how long the lock was in place. Only emitted on an
+                // actual reassert (rare), so release builds stay quiet even though this
+                // runs for every build.
+                if (window.__wetterDebug) {
+                    console.log('__wetter_unlock__ ' + JSON.stringify({
+                        was: bs.position + '/' + bs.overflowY,
+                        t: Math.round(performance.now()),
+                    }));
+                }
+            }
+        }
+        unlock();
+        new MutationObserver(unlock).observe(document.body, {
+            attributes: true,
+            attributeFilter: ['style', 'class'],
+        });
+        var start = performance.now();
+        (function raf() {
+            unlock();
+            if (performance.now() - start < $UNLOCK_WINDOW_MS) {
+                requestAnimationFrame(raf);
+            }
+        })();
+    })();
+""".trimIndent()
+
 private fun jsStringLiteral(value: String): String {
     val escaped = value
         .replace("\\", "\\\\")
@@ -61,6 +121,46 @@ private fun jsStringLiteral(value: String): String {
         .replace("\n", "\\n")
     return "\"$escaped\""
 }
+
+// Debug-only: watches for the page's scroll container becoming non-scrollable (e.g. the
+// consent-dialog scroll-lock that motivated UNLOCK_SCROLL_JS above) and logs a snapshot
+// to the JS console whenever that state changes. Shows up in logcat as
+// "chromium: [INFO:CONSOLE:...] "__wetter_scroll_watch__ ..."" lines, which
+// scripts/analyze_log.py looks for. Only logs on change (not on every poll/mutation) to
+// keep it quiet in normal operation.
+private val SCROLL_WATCH_JS = """
+    (function() {
+        if (window.__wetterScrollWatchInstalled) { return; }
+        window.__wetterScrollWatchInstalled = true;
+        var lastKey = null;
+        function report(reason) {
+            var body = document.body;
+            var bs = getComputedStyle(body);
+            var snapshot = {
+                reason: reason,
+                scrollable: document.documentElement.scrollHeight > window.innerHeight + 1,
+                bodyPosition: bs.position,
+                bodyOverflowY: bs.overflowY,
+                htmlScrollHeight: document.documentElement.scrollHeight,
+                innerHeight: window.innerHeight,
+            };
+            var key = snapshot.bodyPosition + '|' + snapshot.bodyOverflowY + '|' + snapshot.scrollable;
+            if (key === lastKey) { return; }
+            lastKey = key;
+            console.log('__wetter_scroll_watch__ ' + JSON.stringify(snapshot));
+        }
+        report('initial');
+        new MutationObserver(function() { report('mutation'); }).observe(
+            document.body,
+            { attributes: true, attributeFilter: ['style', 'class'] },
+        );
+        var tries = 0;
+        var interval = setInterval(function() {
+            report('poll');
+            if (++tries > 20) { clearInterval(interval); }
+        }, 500);
+    })();
+""".trimIndent()
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -95,6 +195,13 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
             WebView(context).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
+                // Lets the live page be inspected via chrome://inspect on a connected
+                // computer, e.g. to diagnose why an injected CSS rule breaks scrolling.
+                val isDebuggable =
+                    context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+                if (isDebuggable) {
+                    WebView.setWebContentsDebuggingEnabled(true)
+                }
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
                         view: WebView,
@@ -119,7 +226,16 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
 
                     override fun onPageFinished(view: WebView, url: String?) {
                         super.onPageFinished(view, url)
+                        // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging
+                        // is active by the time it runs (and stays off in release builds).
+                        if (isDebuggable) {
+                            view.evaluateJavascript("window.__wetterDebug = true;", null)
+                        }
                         view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
+                        view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
+                        if (isDebuggable) {
+                            view.evaluateJavascript(SCROLL_WATCH_JS, null)
+                        }
                         canGoBack = view.canGoBack()
                     }
                 }
