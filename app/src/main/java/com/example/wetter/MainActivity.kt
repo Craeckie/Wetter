@@ -2,8 +2,11 @@ package com.example.wetter
 
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.graphics.Color
 import android.os.Bundle
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -35,6 +38,8 @@ private val HIDE_SELECTORS = listOf(
     ".geonames-info",
     ".alert-dismissible.alert-default.alert",
     "div.md-mob-margin.mdcss-mobile",
+    ".md-center.mdcss-mobile",
+    "div.spacer-lh-1",
     // Ad slots. These reserve layout height even when no ad loads (none does in
     // this WebView), so leaving them in shows up as large empty bands -- most
     // visibly the top "billboard" margin. Selectors from the maintained public
@@ -63,6 +68,35 @@ private val INJECT_HIDE_STYLE_JS = """
         style.id = id;
         style.textContent = ${jsStringLiteral(HIDE_CSS)};
         document.head.appendChild(style);
+    })();
+""".trimIndent()
+
+// Dark theme via the real Dark Reader engine (bundled MIT-licensed library, see
+// app/src/main/assets/darkreader.js + darkreader-LICENSE.txt), not a CSS filter hack.
+// Dark Reader's Dynamic Theme analyzes each element's actual colors and computes a
+// matching dark replacement per element, which is why saturated content (sun icons,
+// the forecast chart line, section banners) comes out looking natural instead of
+// hue-shifted the way a blanket filter:invert(...)+hue-rotate(180deg) does.
+//
+// Enabling it is idempotent (safe to call from both onPageStarted and onPageFinished),
+// and the "if (!window.DarkReader)" guard around the bundle text keeps it from being
+// re-parsed twice within the same document.
+private val ENABLE_DARKREADER_JS = """
+    (function () {
+        if (!window.DarkReader) { return; }
+        // The standalone bundle can't use the browser extension's privileged
+        // cross-origin fetch for stylesheets; routing through the page's own fetch
+        // at least covers same-origin sheets (this page's own CSS).
+        DarkReader.setFetchMethod(window.fetch);
+        DarkReader.enable({ brightness: 100, contrast: 100, sepia: 0 });
+    })();
+""".trimIndent()
+
+private fun injectDarkReaderJs(bundle: String): String = """
+    (function() {
+        if (!window.DarkReader) {
+            $bundle
+        }
     })();
 """.trimIndent()
 
@@ -133,6 +167,13 @@ private fun jsStringLiteral(value: String): String {
         .replace("\n", "\\n")
     return "\"$escaped\""
 }
+
+// Whether the system is currently in night mode, read live off the WebView's context so
+// it reflects the setting at the time of each page load (the activity restarts on a
+// system theme change, since uiMode isn't declared in android:configChanges).
+private fun isNightMode(context: Context): Boolean =
+    (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+        Configuration.UI_MODE_NIGHT_YES
 
 // Debug-only: watches for the page's scroll container becoming non-scrollable (e.g. the
 // consent-dialog scroll-lock that motivated UNLOCK_SCROLL_JS above) and logs a snapshot
@@ -214,6 +255,19 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                 if (isDebuggable) {
                     WebView.setWebContentsDebuggingEnabled(true)
                 }
+                val isDark = isNightMode(context)
+                // Loaded once per WebView instance rather than per navigation.
+                val darkReaderInjectJs = if (isDark) {
+                    val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                    injectDarkReaderJs(bundle)
+                } else {
+                    null
+                }
+                if (isDark) {
+                    // Avoids a white flash of the WebView's own surface before the page
+                    // has painted and Dark Reader has kicked in.
+                    setBackgroundColor(Color.parseColor("#111111"))
+                }
                 webViewClient = object : WebViewClient() {
                     override fun shouldOverrideUrlLoading(
                         view: WebView,
@@ -234,6 +288,10 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                     override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                         super.onPageStarted(view, url, favicon)
                         view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
+                        if (darkReaderInjectJs != null) {
+                            view.evaluateJavascript(darkReaderInjectJs, null)
+                            view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                        }
                     }
 
                     override fun onPageFinished(view: WebView, url: String?) {
@@ -244,6 +302,14 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                             view.evaluateJavascript("window.__wetterDebug = true;", null)
                         }
                         view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
+                        if (darkReaderInjectJs != null) {
+                            // Re-asserted after load, same as the hide style above, in case
+                            // late page scripts touched <head> after our first injection. The
+                            // "if (!window.DarkReader)" guard keeps this from re-parsing the
+                            // ~346KB bundle a second time within the same document.
+                            view.evaluateJavascript(darkReaderInjectJs, null)
+                            view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                        }
                         view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
                         if (isDebuggable) {
                             view.evaluateJavascript(SCROLL_WATCH_JS, null)
