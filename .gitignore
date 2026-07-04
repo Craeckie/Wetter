@@ -21,3 +21,11 @@ keystore.properties
 /.idea
 
 *.local.md
+
+# Signed APK build output
+*.apk
+*.idsig
+
+# Keystore — never commit credentials
+*.jks
+*.keystore
