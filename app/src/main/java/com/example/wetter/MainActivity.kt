@@ -24,7 +24,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.wetter.ui.theme.AppTheme
 
 private const val WEATHER_URL = "https://kachelmannwetter.com/de/wetter/2892794-city"
@@ -233,10 +236,12 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun WeatherWebView(modifier: Modifier = Modifier) {
     var webView by remember { mutableStateOf<WebView?>(null) }
+    var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
     // into a State explicitly (updated on every navigation) for BackHandler to react
     // to in-page navigation instead of latching to the value from first composition.
     var canGoBack by remember { mutableStateOf(false) }
+    val haptics = LocalHapticFeedback.current
 
     BackHandler(enabled = canGoBack) {
         webView?.goBack()
@@ -245,82 +250,95 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
     AndroidView(
         modifier = modifier.fillMaxSize(),
         factory = { context ->
-            WebView(context).apply {
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
-                // Lets the live page be inspected via chrome://inspect on a connected
-                // computer, e.g. to diagnose why an injected CSS rule breaks scrolling.
-                val isDebuggable =
-                    context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
-                if (isDebuggable) {
-                    WebView.setWebContentsDebuggingEnabled(true)
+            SwipeRefreshLayout(context).apply {
+                setOnRefreshListener {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    webView?.reload()
                 }
-                val isDark = isNightMode(context)
-                // Loaded once per WebView instance rather than per navigation.
-                val darkReaderInjectJs = if (isDark) {
-                    val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
-                    injectDarkReaderJs(bundle)
-                } else {
-                    null
-                }
-                if (isDark) {
-                    // Avoids a white flash of the WebView's own surface before the page
-                    // has painted and Dark Reader has kicked in.
-                    setBackgroundColor(Color.parseColor("#111111"))
-                }
-                webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(
-                        view: WebView,
-                        request: WebResourceRequest,
-                    ): Boolean {
-                        val url = request.url
-                        if (url.scheme == "http" || url.scheme == "https") return false
-                        // Non-http(s) links (mailto:, tel:, intent:, ...) can't be
-                        // loaded by the WebView itself; hand them to the system.
-                        return try {
-                            view.context.startActivity(Intent(Intent.ACTION_VIEW, url))
-                            true
-                        } catch (_: ActivityNotFoundException) {
-                            true
-                        }
-                    }
-
-                    override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
-                        super.onPageStarted(view, url, favicon)
-                        view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
-                        if (darkReaderInjectJs != null) {
-                            view.evaluateJavascript(darkReaderInjectJs, null)
-                            view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
-                        }
-                    }
-
-                    override fun onPageFinished(view: WebView, url: String?) {
-                        super.onPageFinished(view, url)
-                        // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging
-                        // is active by the time it runs (and stays off in release builds).
+                addView(
+                    WebView(context).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        // Lets the live page be inspected via chrome://inspect on a connected
+                        // computer, e.g. to diagnose why an injected CSS rule breaks scrolling.
+                        val isDebuggable =
+                            context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
                         if (isDebuggable) {
-                            view.evaluateJavascript("window.__wetterDebug = true;", null)
+                            WebView.setWebContentsDebuggingEnabled(true)
                         }
-                        view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
-                        if (darkReaderInjectJs != null) {
-                            // Re-asserted after load, same as the hide style above, in case
-                            // late page scripts touched <head> after our first injection. The
-                            // "if (!window.DarkReader)" guard keeps this from re-parsing the
-                            // ~346KB bundle a second time within the same document.
-                            view.evaluateJavascript(darkReaderInjectJs, null)
-                            view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                        val isDark = isNightMode(context)
+                        // Loaded once per WebView instance rather than per navigation.
+                        val darkReaderInjectJs = if (isDark) {
+                            val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                            injectDarkReaderJs(bundle)
+                        } else {
+                            null
                         }
-                        view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
-                        if (isDebuggable) {
-                            view.evaluateJavascript(SCROLL_WATCH_JS, null)
+                        if (isDark) {
+                            // Avoids a white flash of the WebView's own surface before the page
+                            // has painted and Dark Reader has kicked in.
+                            setBackgroundColor(Color.parseColor("#111111"))
                         }
-                        canGoBack = view.canGoBack()
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView,
+                                request: WebResourceRequest,
+                            ): Boolean {
+                                val url = request.url
+                                if (url.scheme == "http" || url.scheme == "https") return false
+                                // Non-http(s) links (mailto:, tel:, intent:, ...) can't be
+                                // loaded by the WebView itself; hand them to the system.
+                                return try {
+                                    view.context.startActivity(Intent(Intent.ACTION_VIEW, url))
+                                    true
+                                } catch (_: ActivityNotFoundException) {
+                                    true
+                                }
+                            }
+
+                            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
+                                if (darkReaderInjectJs != null) {
+                                    view.evaluateJavascript(darkReaderInjectJs, null)
+                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                                }
+                            }
+
+                            override fun onPageFinished(view: WebView, url: String?) {
+                                super.onPageFinished(view, url)
+                                // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging
+                                // is active by the time it runs (and stays off in release builds).
+                                if (isDebuggable) {
+                                    view.evaluateJavascript("window.__wetterDebug = true;", null)
+                                }
+                                view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
+                                if (darkReaderInjectJs != null) {
+                                    // Re-asserted after load, same as the hide style above, in case
+                                    // late page scripts touched <head> after our first injection. The
+                                    // "if (!window.DarkReader)" guard keeps this from re-parsing the
+                                    // ~346KB bundle a second time within the same document.
+                                    view.evaluateJavascript(darkReaderInjectJs, null)
+                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                                }
+                                view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
+                                if (isDebuggable) {
+                                    view.evaluateJavascript(SCROLL_WATCH_JS, null)
+                                }
+                                canGoBack = view.canGoBack()
+                                swipeRefreshLayout?.isRefreshing = false
+                            }
+                        }
+                        loadUrl(WEATHER_URL)
+                        webView = this
                     }
-                }
-                loadUrl(WEATHER_URL)
-                webView = this
+                )
+                swipeRefreshLayout = this
             }
         },
-        onRelease = { it.destroy() },
+        onRelease = {
+            webView?.destroy()
+            webView = null
+        },
     )
 }
