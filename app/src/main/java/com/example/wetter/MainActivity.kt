@@ -43,6 +43,9 @@ private val HIDE_SELECTORS = listOf(
     "div.md-mob-margin.mdcss-mobile",
     ".md-center.mdcss-mobile",
     "div.spacer-lh-1",
+    ".modal-body > p",
+    ".modal-body > .table:nth-of-type(1)",
+    ".modal-body > .alert-warning.alert",
     // Ad slots. These reserve layout height even when no ad loads (none does in
     // this WebView), so leaving them in shows up as large empty bands -- most
     // visibly the top "billboard" margin. Selectors from the maintained public
