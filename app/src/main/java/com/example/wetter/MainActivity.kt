@@ -165,6 +165,14 @@ private val INJECT_HIDE_STYLE_JS = """
 // Enabling it is idempotent (safe to call from both onPageStarted and onPageFinished),
 // and the "if (!window.DarkReader)" guard around the bundle text keeps it from being
 // re-parsed twice within the same document.
+//
+// Dark Reader is skipped entirely when the site's *own* dark theme is active (the
+// server renders <body class="... dark"> then). Running it on top of an already-dark
+// page is not just redundant, it wrecks the Highcharts diagrams: their grid lines are
+// inline SVG strokes in near-black (#171717/#262627), which Dark Reader "fixes" by
+// inverting to near-white, turning the subtle grid glaring bright. The body class can
+// flip without a page load (the site's theme toggle), so a MutationObserver keeps
+// Dark Reader's state in sync with it.
 private val ENABLE_DARKREADER_JS = """
     (function () {
         if (!window.DarkReader) { return; }
@@ -172,7 +180,56 @@ private val ENABLE_DARKREADER_JS = """
         // cross-origin fetch for stylesheets; routing through the page's own fetch
         // at least covers same-origin sheets (this page's own CSS).
         DarkReader.setFetchMethod(window.fetch);
-        DarkReader.enable({ brightness: 100, contrast: 100, sepia: 0 });
+        function apply() {
+            var siteDark = document.body && document.body.classList.contains('dark');
+            if (siteDark) {
+                if (DarkReader.isEnabled()) { DarkReader.disable(); }
+            } else if (!DarkReader.isEnabled()) {
+                DarkReader.enable({ brightness: 100, contrast: 100, sepia: 0 });
+            }
+        }
+        if (document.body) {
+            apply();
+        } else {
+            // onPageStarted can run before <body> exists; decide once it does.
+            document.addEventListener('DOMContentLoaded', apply);
+        }
+        if (document.body && !window.__wetterDarkObserverInstalled) {
+            window.__wetterDarkObserverInstalled = true;
+            new MutationObserver(apply).observe(document.body, {
+                attributes: true,
+                attributeFilter: ['class'],
+            });
+        }
+    })();
+""".trimIndent()
+
+// When the system is in night mode but the site is still on its light theme, click the
+// site's own dark-mode toggle once. That flips the theme the site-native way (persisted
+// server-side via cookie, so subsequent loads render dark directly), and the body-class
+// observer in ENABLE_DARKREADER_JS then shuts Dark Reader off -- the native dark theme
+// renders the Highcharts diagrams correctly, which Dark Reader does not (see above).
+// Guards: body.dark check means an already-dark site is never toggled back to light, and
+// the sessionStorage flag means we only ever auto-click once per WebView session, so a
+// user tapping the toggle to deliberately go light isn't fought. The retry loop covers
+// the toggle's click handler living in a late-loading script bundle.
+private val AUTO_SITE_DARK_JS = """
+    (function() {
+        if (window.__wetterAutoDarkInstalled) { return; }
+        window.__wetterAutoDarkInstalled = true;
+        try { if (sessionStorage.getItem('__wetterAutoDark')) { return; } } catch (e) {}
+        function attempt(tries) {
+            var body = document.body;
+            if (!body || body.classList.contains('dark')) { return; }
+            var btn = document.querySelector('button.darkmode-toggle');
+            if (btn) {
+                try { sessionStorage.setItem('__wetterAutoDark', '1'); } catch (e) {}
+                btn.click();
+            } else if (tries > 0) {
+                setTimeout(function() { attempt(tries - 1); }, 500);
+            }
+        }
+        attempt(10);
     })();
 """.trimIndent()
 
@@ -402,6 +459,9 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                                     // ~346KB bundle a second time within the same document.
                                     view.evaluateJavascript(darkReaderInjectJs, null)
                                     view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                                }
+                                if (darkReaderInjectJs != null) {
+                                    view.evaluateJavascript(AUTO_SITE_DARK_JS, null)
                                 }
                                 view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
                                 if (isDebuggable) {
