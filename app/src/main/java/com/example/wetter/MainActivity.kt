@@ -59,8 +59,81 @@ private val HIDE_SELECTORS = listOf(
     "[href=\"https://pflotsh.com\"]",
 )
 
+// The weather-infos divs are mostly SEO text, hidden above -- except two of them, which
+// hold the model-picker buttons (a.make-btn-mobile) for the compact forecast and the
+// 14-day trend. Those divs are re-shown, but with their text collapsed (font-size: 0 +
+// visibility: hidden) so only the buttons render. :not(:has(h2,h3,h4)) keeps the third
+// button-holding div -- the ~50 "nearby places" links under a heading -- hidden.
+//
+// The buttons themselves are restyled as compact chips, with the model's parameters
+// encoded visually (classes added by CLASSIFY_MODEL_BUTTONS_JS below):
+//   - update interval: a leading lightning bolt marks Rapid-Update/Nowcast models
+//   - resolution: a light blue border marks HD models
+//   - scope: global models (rarely used) are demoted -- moved to the end of the list
+//     and drawn as small gray outline chips; regional/local ones keep the solid blue.
+private val SHOW_BUTTONS_CSS = """
+    div.weather-infos:has(a.make-btn-mobile):not(:has(h2, h3, h4)) {
+        display: block !important;
+        visibility: hidden !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+    }
+    div.weather-infos a.make-btn-mobile {
+        visibility: visible !important;
+        display: inline-block !important;
+        font-size: 12px !important;
+        line-height: 1.3 !important;
+        font-weight: normal !important;
+        padding: 4px 10px !important;
+        /* Also restores the inter-button gap that was a whitespace text node
+           before font-size: 0 collapsed it. */
+        margin: 0 4px 5px 0 !important;
+        border-radius: 12px !important;
+        border: 1px solid transparent !important;
+    }
+    div.weather-infos a.make-btn-mobile.w-rapid::before { content: '\26A1 '; }
+    div.weather-infos a.make-btn-mobile.w-hd { border-color: #7fb3e8 !important; }
+    div.weather-infos a.make-btn-mobile.w-global {
+        background: transparent !important;
+        border-color: #555 !important;
+        color: #999 !important;
+        font-size: 11px !important;
+        padding: 2px 8px !important;
+    }
+    div.weather-infos a.make-btn-mobile.w-global.w-hd { border-color: #47617e !important; }
+"""
+
+// Tags each model-picker button with classes for SHOW_BUTTONS_CSS (scope/interval/
+// resolution parsed from the button label) and moves global-model buttons behind the
+// regional ones. Classification keywords: model names containing "Global"/"ECMWF"/other
+// global-model acronyms are global unless the name also scopes them to Europe
+// ("Mitteleuropa", "Europa ", Swiss); "UKMO(?! UK)" keeps "Großbritannien HD (UKMO UK)"
+// -- the UK regional model -- out of the global bucket while "Global Britain (UKMO)"
+// still lands in it. Idempotent: re-adding classes and re-appending in the same order
+// is a no-op, so re-running it on the same document is safe.
+private val CLASSIFY_MODEL_BUTTONS_JS = """
+    (function() {
+        document.querySelectorAll('div.weather-infos a.make-btn-mobile').forEach(function(a) {
+            var t = a.textContent;
+            var global = (/Global|ECMWF|GFS|JMA|GEM|UKMO(?! UK)|ACCESS|GDAPS|ARPEGE/i.test(t)
+                && !/Mitteleuropa|Europa |Swiss|Schweiz/i.test(t)) || /\(Global\)/.test(t);
+            a.classList.add(global ? 'w-global' : 'w-regional');
+            if (/Rapid|Nowcast/i.test(t)) { a.classList.add('w-rapid'); }
+            if (/HD/.test(t)) { a.classList.add('w-hd'); }
+        });
+        document.querySelectorAll('div.weather-infos').forEach(function(div) {
+            if (div.querySelector('h2, h3, h4')) { return; }
+            var globals = div.querySelectorAll('a.make-btn-mobile.w-global');
+            if (!globals.length) { return; }
+            var p = globals[0].parentElement;
+            globals.forEach(function(b) { p.appendChild(b); });
+        });
+    })();
+""".trimIndent()
+
 private val HIDE_CSS =
-    HIDE_SELECTORS.joinToString(separator = ",\n") { it } + " { display: none !important; }"
+    HIDE_SELECTORS.joinToString(separator = ",\n") { it } + " { display: none !important; }\n" +
+        SHOW_BUTTONS_CSS
 
 // Injects a <style> tag with the hide rules, guarded by id so repeated calls
 // (onPageStarted + onPageFinished) don't insert it twice. display:none !important
@@ -316,6 +389,7 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                                     view.evaluateJavascript("window.__wetterDebug = true;", null)
                                 }
                                 view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
+                                view.evaluateJavascript(CLASSIFY_MODEL_BUTTONS_JS, null)
                                 if (darkReaderInjectJs != null) {
                                     // Re-asserted after load, same as the hide style above, in case
                                     // late page scripts touched <head> after our first injection. The
