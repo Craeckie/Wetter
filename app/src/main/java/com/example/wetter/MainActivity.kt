@@ -51,6 +51,11 @@ private val HIDE_SELECTORS = listOf(
     // visibly the top "billboard" margin. Selectors from the maintained public
     // lists: uBlock uAssets (dkpw-billboard-margin*, kw-ad-right, #meteosafe,
     // pflotsh promo) and EasyList Germany (.dkpw).
+    // Footer content below the country selector: the advertising-contact /
+    // B2B block next to it, and the whole bottom bar (social links, app/API
+    // links, legal links, copyright).
+    "footer.footer2 .footer-text",
+    ".footer2-bottom",
     ".dkpw-billboard-margin",
     ".dkpw-billboard-margin-fixed",
     ".dkpw",
