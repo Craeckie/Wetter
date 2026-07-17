@@ -8,6 +8,11 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Bundle
+import android.util.Log
+import android.view.ViewGroup
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -301,6 +306,30 @@ private val UNLOCK_SCROLL_JS = """
     })();
 """.trimIndent()
 
+// Shown instead of the WebView's stock "Webpage not available" page when the main frame
+// fails to load (no network, server down, timeout). Auto-retries via meta refresh every
+// 8 seconds and immediately on tap; matches the app's day/night background so the error
+// state doesn't flash a mismatched screen.
+private fun errorPageHtml(isDark: Boolean, reason: String): String {
+    val bg = if (isDark) "#111111" else "#fafafa"
+    val fg = if (isDark) "#9e9e9e" else "#555555"
+    return """
+        <!doctype html><html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="refresh" content="8;url=$WEATHER_URL">
+        <style>
+            body { background: $bg; color: $fg; font-family: sans-serif; margin: 0;
+                   height: 100vh; display: flex; align-items: center; justify-content: center; }
+            a { color: inherit; text-align: center; text-decoration: none; padding: 2em; }
+            small { opacity: .6 }
+        </style>
+        </head><body>
+        <a href="$WEATHER_URL">kachelmannwetter.com is unreachable<br>
+        <small>$reason &middot; retrying automatically, tap to retry now</small></a>
+        </body></html>
+    """.trimIndent()
+}
+
 private fun jsStringLiteral(value: String): String {
     val escaped = value
         .replace("\\", "\\\\")
@@ -389,12 +418,28 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
         modifier = modifier.fillMaxSize(),
         factory = { context ->
             SwipeRefreshLayout(context).apply {
+                // Compose's AndroidView holder adds the factory view without LayoutParams, so
+                // it would get the ViewGroup default WRAP_CONTENT. A WebView whose
+                // layoutParams.height is WRAP_CONTENT switches Chromium into grow-with-content
+                // mode, where CSS percentage heights resolve against zero (found the hard way
+                // in the lightningmaps sibling, where the page collapsed to its min-height
+                // floors). This app currently survives because SwipeRefreshLayout measures its
+                // child with exact specs — but set MATCH_PARENT explicitly on both views so
+                // correct sizing doesn't hinge on that wrapper implementation detail.
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
                 setOnRefreshListener {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     webView?.reload()
                 }
                 addView(
                     WebView(context).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                        )
                         settings.javaScriptEnabled = true
                         settings.domStorageEnabled = true
                         // Lets the live page be inspected via chrome://inspect on a connected
@@ -403,6 +448,17 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                             context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
                         if (isDebuggable) {
                             WebView.setWebContentsDebuggingEnabled(true)
+                        }
+                        // Page console → logcat, so injection state is visible via
+                        // `adb logcat -s Wetter` even without a chrome://inspect session.
+                        // Returns false (unlike the lightningmaps sibling) so chromium still
+                        // emits its own "[INFO:CONSOLE]" lines — scripts/analyze_log.py greps
+                        // for those.
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                                Log.d("Wetter", "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
+                                return false
+                            }
                         }
                         val isDark = isNightMode(context)
                         // Loaded once per WebView instance rather than per navigation.
@@ -432,6 +488,24 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                                 } catch (_: ActivityNotFoundException) {
                                     true
                                 }
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView,
+                                request: WebResourceRequest,
+                                error: WebResourceError,
+                            ) {
+                                super.onReceivedError(view, request, error)
+                                // Subresources (ads, trackers) fail all the time — only a failed
+                                // main document warrants the error screen.
+                                if (!request.isForMainFrame) return
+                                view.loadDataWithBaseURL(
+                                    null,
+                                    errorPageHtml(isNightMode(view.context), error.description.toString()),
+                                    "text/html",
+                                    "utf-8",
+                                    null,
+                                )
                             }
 
                             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {

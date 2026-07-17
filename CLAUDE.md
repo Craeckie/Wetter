@@ -84,6 +84,24 @@ analyzer:
 4. Debug builds also call `WebView.setWebContentsDebuggingEnabled(true)`, so the live page can
    be inspected directly via `chrome://inspect#devices` on a computer with the phone connected
    over USB.
+5. The page console is also forwarded to logcat under the `Wetter` tag
+   (`adb logcat -s Wetter`), in all builds. The `WebChromeClient.onConsoleMessage` override
+   returns `false` so chromium keeps emitting its own `[INFO:CONSOLE]` lines — that's what
+   `scripts/analyze_log.py` greps for.
+
+Three hardening behaviors backported from the lightningmaps sibling project:
+
+- **Explicit `MATCH_PARENT` layout params** on both the `SwipeRefreshLayout` and the `WebView`.
+  Compose's `AndroidView` holder adds the factory view without `LayoutParams` (ViewGroup
+  default: `WRAP_CONTENT`), and a WebView whose `layoutParams.height` is `WRAP_CONTENT`
+  switches Chromium into grow-with-content mode where CSS percentage heights resolve against
+  zero. This app happened to work only because `SwipeRefreshLayout` measures its child with
+  exact specs; the explicit params remove that hidden dependency.
+- **In-app error page** (`errorPageHtml`): replaces the stock "Webpage not available" page when
+  the main frame fails to load (`onReceivedError`, main frame only — subresources fail
+  routinely). Matches the day/night background, auto-retries via meta refresh every 8 s, and
+  retries immediately on tap.
+- **Console → logcat forwarding** (see item 5 above).
 
 ## Local release (optional)
 
