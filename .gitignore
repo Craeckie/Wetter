@@ -32,3 +32,7 @@ keystore.properties
 
 # Playwright MCP session artifacts
 .playwright-mcp/
+
+# Locally-kept page snapshots used to develop injected CSS/JS selectors offline
+# (not committed: large, and a full copy of a third-party site's markup).
+/scripts/reference-local/

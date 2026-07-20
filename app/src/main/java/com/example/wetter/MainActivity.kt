@@ -127,7 +127,7 @@ private val SHOW_BUTTONS_CSS = """
 // rows (one per hour), matching the app's overall vertical-scroll layout instead of adding
 // a second, orthogonal scroll axis.
 //
-// Native structure (from scripts/reference/kachelmannwetter-reference-page.html):
+// Native structure (from scripts/reference-local/kachelmannwetter-reference-page.html):
 //   .nexthours-scroll (overflow-x:scroll, height:140px)
 //     > .nexthours-wrapper (width:3043px -- 24 tiles x 126.7px, floated in one row)
 //         .nexthours-hour (width:126.7px, float:left) x 24
@@ -215,7 +215,7 @@ private val CLASSIFY_MODEL_BUTTONS_JS = """
 // radar and hourly-tiles blocks need to swap; the charts already come last. All three are
 // direct children of #kompakt-vorhersage (the col-md-8 forecast column), so a flexbox
 // `order` override reorders them without moving any DOM nodes. IDs confirmed against
-// scripts/reference/kachelmannwetter-reference-page.html.
+// scripts/reference-local/kachelmannwetter-reference-page.html.
 private val REORDER_SECTIONS_CSS = """
     #kompakt-vorhersage { display: flex !important; flex-direction: column !important; }
     #kompakt-vorhersage > * { order: 3 !important; }
