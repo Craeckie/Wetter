@@ -74,12 +74,33 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          RELEASE_ID=$(curl -sf -X POST \
-            -H "Authorization: token $GITEA_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"tag_name\": \"$TAG\", \"name\": \"$TAG\"}" \
-            "$API_URL/repos/$REPOSITORY/releases" | jq -r .id)
-          curl -sf -X POST \
-            -H "Authorization: token $GITEA_TOKEN" \
-            -F "attachment=@${APK_PATH};type=application/vnd.android.package-archive" \
-            "$API_URL/repos/$REPOSITORY/releases/$RELEASE_ID/assets?name=$(basename "$APK_PATH")"
+          # Reuse an existing release for this tag if one is already there (e.g. a retry),
+          # otherwise create it. Works the same on GitHub and Gitea.
+          RELEASE_JSON=$(curl -sf -H "Authorization: token $GITEA_TOKEN" \
+            "$API_URL/repos/$REPOSITORY/releases/tags/$TAG" || true)
+          if [ -z "$RELEASE_JSON" ] || [ "$(echo "$RELEASE_JSON" | jq -r '.id // empty')" = "" ]; then
+            RELEASE_JSON=$(curl -sf -X POST \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"tag_name\": \"$TAG\", \"name\": \"$TAG\"}" \
+              "$API_URL/repos/$REPOSITORY/releases")
+          fi
+          RELEASE_ID=$(echo "$RELEASE_JSON" | jq -r .id)
+          ASSET_NAME=$(basename "$APK_PATH")
+
+          # GitHub uploads assets through a separate uploads.github.com host using the
+          # release's `upload_url` (raw binary body). Gitea uploads to the same API host,
+          # multipart, under .../releases/{id}/assets. Branch on which API we're talking to.
+          if [[ "$API_URL" == *"api.github.com"* ]]; then
+            UPLOAD_URL=$(echo "$RELEASE_JSON" | jq -r '.upload_url' | sed 's/{?name,label}//')
+            curl -sf -X POST \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -H "Content-Type: application/vnd.android.package-archive" \
+              --data-binary "@${APK_PATH}" \
+              "${UPLOAD_URL}?name=${ASSET_NAME}"
+          else
+            curl -sf -X POST \
+              -H "Authorization: token $GITEA_TOKEN" \
+              -F "attachment=@${APK_PATH};type=application/vnd.android.package-archive" \
+              "$API_URL/repos/$REPOSITORY/releases/$RELEASE_ID/assets?name=${ASSET_NAME}"
+          fi
