@@ -31,14 +31,17 @@ jobs:
       # Optional: sign APK if keystore secrets are configured
       # Add these secrets to your repo: KEYSTORE_BASE64, KEYSTORE_PASSWORD
       - name: Sign APK
-        if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+        if: ${{ env.KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > keystore.jks
+          echo "$KEYSTORE_BASE64" | base64 --decode > keystore.jks
           $ANDROID_SDK_ROOT/build-tools/$(ls $ANDROID_SDK_ROOT/build-tools | tail -1)/apksigner sign \
             --ks keystore.jks \
-            --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
             --ks-key-alias my-key \
-            --key-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+            --key-pass "pass:$KEYSTORE_PASSWORD" \
             app/build/outputs/apk/release/app-release-unsigned.apk
           mv app/build/outputs/apk/release/app-release-unsigned.apk \
              app/build/outputs/apk/release/app-release.apk
