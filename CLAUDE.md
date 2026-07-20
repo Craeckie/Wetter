@@ -143,5 +143,6 @@ Prerequisites:
 ## CI
 
 `.github/workflows/build.yml` runs unit tests and builds a release APK on every push.
-APK signing is optional — add `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD`
-as GitHub repo secrets to enable it.
+APK signing is optional — add `KEYSTORE_BASE64` and `KEYSTORE_PASSWORD` as GitHub repo secrets to
+enable it. The key alias is hardcoded to `my-key` and the key password reuses `KEYSTORE_PASSWORD`
+(same convention as `scripts/release.sh`) — no separate `KEY_ALIAS`/`KEY_PASSWORD` secrets needed.
