@@ -67,6 +67,16 @@ private val HIDE_SELECTORS = listOf(
     ".kw-ad-right",
     "#meteosafe",
     "[href=\"https://pflotsh.com\"]",
+    // SourcePoint consent/CMP overlay ("Willkommen auf unserem Wetterportal" welcome +
+    // tracking-consent dialog). Its actual content renders inside SourcePoint's own
+    // message iframe, so it can't be targeted by content -- these are the same
+    // convention-based id/class patterns public cookie-notice filter lists (uBlock/
+    // EasyList) use for SourcePoint's standard container markup, not something scraped
+    // from this specific page. Hiding it here is purely cosmetic; UNLOCK_SCROLL_JS
+    // already handles the body scroll-lock this same script applies underneath it.
+    "iframe[id^=\"sp_message_iframe_\"]",
+    "div[id^=\"sp_message_container_\"]",
+    ".message-container",
 )
 
 // The weather-infos divs are mostly SEO text, hidden above -- except two of them, which
@@ -113,6 +123,64 @@ private val SHOW_BUTTONS_CSS = """
     div.weather-infos a.make-btn-mobile.w-global.w-hd { border-color: #47617e !important; }
 """
 
+// Turns the horizontally-scrolling hourly tile carousel into a compact vertical list of
+// rows (one per hour), matching the app's overall vertical-scroll layout instead of adding
+// a second, orthogonal scroll axis.
+//
+// Native structure (from scripts/reference/kachelmannwetter-reference-page.html):
+//   .nexthours-scroll (overflow-x:scroll, height:140px)
+//     > .nexthours-wrapper (width:3043px -- 24 tiles x 126.7px, floated in one row)
+//         .nexthours-hour (width:126.7px, float:left) x 24
+//           .fc-hours (time, colored badge) / .fc-symbol (icon) / .fc-temp / .fc-rain (%)
+// Every dimension above exists purely to force 24 fixed-width cards onto one floated row
+// inside a horizontally-scrollable viewport; overriding scroll/width/float turns the same
+// markup into an ordinary flex column, and turning each tile into a flex row lays its four
+// children (time/icon/temp/rain) out side by side as one compact list row.
+private val COMPACT_HOURLY_CSS = """
+    .nexthours-scroll {
+        height: auto !important;
+        overflow-x: visible !important;
+        overflow-y: visible !important;
+    }
+    .nexthours-wrapper {
+        width: 100% !important;
+        display: flex !important;
+        flex-direction: column !important;
+    }
+    .nexthours-hour {
+        width: 100% !important;
+        float: none !important;
+        display: flex !important;
+        flex-direction: row !important;
+        align-items: center !important;
+        padding: 4px 8px !important;
+        border-left: none !important;
+        border-bottom: 1px solid var(--gray-300);
+    }
+    .nexthours-hour:last-child { border-bottom: none; }
+    .nexthours-hour .fc-hours {
+        flex: 0 0 60px !important;
+        border-radius: 6px !important;
+        padding: 3px 0 !important;
+        margin: 0 8px 0 0 !important;
+    }
+    .nexthours-hour .fc-symbol {
+        flex: 0 0 36px !important;
+        margin: 0 8px !important;
+    }
+    .nexthours-hour .fc-temp {
+        flex: 0 0 56px !important;
+        text-align: right !important;
+    }
+    .nexthours-hour .fc-rain {
+        flex: 1 1 auto !important;
+        text-align: right !important;
+    }
+    /* The page renders 24 hourly tiles; keep only the next 12. kacheln-first (the
+       current hour) is the 1st tile, so the 13th-and-on are the ones beyond 12h out. */
+    .nexthours-hour:nth-child(n + 13) { display: none !important; }
+"""
+
 // Tags each model-picker button with classes for SHOW_BUTTONS_CSS (scope/interval/
 // resolution parsed from the button label) and moves global-model buttons behind the
 // regional ones. Classification keywords: model names containing "Global"/"ECMWF"/other
@@ -141,9 +209,26 @@ private val CLASSIFY_MODEL_BUTTONS_JS = """
     })();
 """.trimIndent()
 
+// Reorders the three main sections of the forecast column into: 12-hour overview, radar
+// map, future days. The page's own order is headline -> radar map (#weather-overview-maps)
+// -> hourly tiles (#weather-overview-nexthoursdays) -> 2-day/14-day charts, so only the
+// radar and hourly-tiles blocks need to swap; the charts already come last. All three are
+// direct children of #kompakt-vorhersage (the col-md-8 forecast column), so a flexbox
+// `order` override reorders them without moving any DOM nodes. IDs confirmed against
+// scripts/reference/kachelmannwetter-reference-page.html.
+private val REORDER_SECTIONS_CSS = """
+    #kompakt-vorhersage { display: flex !important; flex-direction: column !important; }
+    #kompakt-vorhersage > * { order: 3 !important; }
+    #kompakt-vorhersage > #weather-overview-mesoanalyse,
+    #kompakt-vorhersage > #forecast-url,
+    #kompakt-vorhersage > #weather-overview-uwz { order: 0 !important; }
+    #kompakt-vorhersage > #weather-overview-nexthoursdays { order: 1 !important; }
+    #kompakt-vorhersage > #weather-overview-maps { order: 2 !important; }
+"""
+
 private val HIDE_CSS =
     HIDE_SELECTORS.joinToString(separator = ",\n") { it } + " { display: none !important; }\n" +
-        SHOW_BUTTONS_CSS
+        SHOW_BUTTONS_CSS + "\n" + REORDER_SECTIONS_CSS + "\n" + COMPACT_HOURLY_CSS
 
 // Injects a <style> tag with the hide rules, guarded by id so repeated calls
 // (onPageStarted + onPageFinished) don't insert it twice. display:none !important
