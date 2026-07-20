@@ -48,6 +48,12 @@ private val HIDE_SELECTORS = listOf(
     "div.md-mob-margin.mdcss-mobile",
     ".md-center.mdcss-mobile",
     "div.spacer-lh-1",
+    // Site header (logo, country selector, empty mobile nav) -- pure chrome, this app has
+    // no use for cross-site navigation or the country switcher.
+    "header",
+    // Decorative 15px gradient-colored strip rendered directly under the header, above
+    // everything else on the page (incl. the Wetterübersicht-Menü toggle) -- pure chrome.
+    ".template-gradient-bar",
     ".modal-body > p",
     ".modal-body > .table:nth-of-type(1)",
     ".modal-body > .alert-warning.alert",
@@ -226,9 +232,32 @@ private val REORDER_SECTIONS_CSS = """
     #kompakt-vorhersage > #weather-overview-maps { order: 2 !important; }
 """
 
+// The site's own dark theme (body.dark, active whenever Dark Reader is disabled below)
+// paints body/header/.navbar2/.wrap from the single --background-body custom property
+// (#26282B, a dark grey) rather than true black -- confirmed against
+// scripts/reference-local/kachelmannwetter-reference-page.html. Overriding just that
+// variable turns the whole chrome + content background AMOLED-black without touching the
+// button/card colors that are set from their own separate variables.
+private val AMOLED_CSS = """
+    .dark { --background-body: #000000 !important; }
+"""
+
+// .kw-wrapper reserves top padding (--header-top-padding, ~165px) to make room for the now-
+// hidden fixed-position header, and .spacer-lh-3 is a 42px empty decorative spacer right
+// below it -- without zeroing both, hiding "header" above just leaves a big blank gap.
+private val REMOVE_HEADER_SPACE_CSS = """
+    .kw-wrapper { padding-top: 0 !important; }
+    .spacer-lh-3 { height: 0 !important; }
+    /* .menue-button is position:fixed with a top offset tuned to sit just below the (now
+       hidden) header -- without this it floats fixed over the page content instead of
+       sitting in normal flow above it. */
+    .menue-button { position: static !important; top: auto !important; }
+"""
+
 private val HIDE_CSS =
     HIDE_SELECTORS.joinToString(separator = ",\n") { it } + " { display: none !important; }\n" +
-        SHOW_BUTTONS_CSS + "\n" + REORDER_SECTIONS_CSS + "\n" + COMPACT_HOURLY_CSS
+        SHOW_BUTTONS_CSS + "\n" + REORDER_SECTIONS_CSS + "\n" + COMPACT_HOURLY_CSS + "\n" +
+        AMOLED_CSS + "\n" + REMOVE_HEADER_SPACE_CSS
 
 // Injects a <style> tag with the hide rules, guarded by id so repeated calls
 // (onPageStarted + onPageFinished) don't insert it twice. display:none !important
@@ -275,7 +304,10 @@ private val ENABLE_DARKREADER_JS = """
             if (siteDark) {
                 if (DarkReader.isEnabled()) { DarkReader.disable(); }
             } else if (!DarkReader.isEnabled()) {
-                DarkReader.enable({ brightness: 100, contrast: 100, sepia: 0 });
+                DarkReader.enable({
+                    brightness: 100, contrast: 100, sepia: 0,
+                    darkSchemeBackgroundColor: '#000000',
+                });
             }
         }
         if (document.body) {
@@ -396,7 +428,7 @@ private val UNLOCK_SCROLL_JS = """
 // 8 seconds and immediately on tap; matches the app's day/night background so the error
 // state doesn't flash a mismatched screen.
 private fun errorPageHtml(isDark: Boolean, reason: String): String {
-    val bg = if (isDark) "#111111" else "#fafafa"
+    val bg = if (isDark) "#000000" else "#fafafa"
     val fg = if (isDark) "#9e9e9e" else "#555555"
     return """
         <!doctype html><html><head>
@@ -556,7 +588,7 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                         if (isDark) {
                             // Avoids a white flash of the WebView's own surface before the page
                             // has painted and Dark Reader has kicked in.
-                            setBackgroundColor(Color.parseColor("#111111"))
+                            setBackgroundColor(Color.parseColor("#000000"))
                         }
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(
