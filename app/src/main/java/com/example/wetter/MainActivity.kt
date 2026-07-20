@@ -35,7 +35,29 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.wetter.ui.theme.AppTheme
 
-private const val WEATHER_URL = "https://kachelmannwetter.com/de/wetter/2892794-city"
+// First-launch entry point for the city search screen -- the site's own homepage, whose
+// header carries its native city search box (with autocomplete). Once the user picks a
+// city from it, its resulting weather-page URL is persisted and loaded directly on every
+// future launch instead.
+private const val SEARCH_URL = "https://kachelmannwetter.com/de/"
+
+// Matches a per-city weather page, e.g. ".../de/wetter/2892794-city" -- used to detect
+// that the user's city search has landed on a real city page (as opposed to the homepage
+// itself, an intermediate redirect, or an unrelated site link).
+private val CITY_URL_REGEX = Regex("""^https://(www\.)?kachelmannwetter\.com/de/wetter/\d+-[^/?#]+""")
+
+private const val PREFS_NAME = "wetter_prefs"
+private const val KEY_CITY_URL = "city_url"
+
+private fun readCityUrl(context: Context): String? =
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_CITY_URL, null)
+
+private fun saveCityUrl(context: Context, url: String) {
+    context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .putString(KEY_CITY_URL, url)
+        .apply()
+}
 
 // Elements to strip from the page, carried over from the equivalent uBlock Origin
 // cosmetic filters (kachelmannwetter.com##...).
@@ -427,13 +449,13 @@ private val UNLOCK_SCROLL_JS = """
 // fails to load (no network, server down, timeout). Auto-retries via meta refresh every
 // 8 seconds and immediately on tap; matches the app's day/night background so the error
 // state doesn't flash a mismatched screen.
-private fun errorPageHtml(isDark: Boolean, reason: String): String {
+private fun errorPageHtml(isDark: Boolean, reason: String, retryUrl: String): String {
     val bg = if (isDark) "#000000" else "#fafafa"
     val fg = if (isDark) "#9e9e9e" else "#555555"
     return """
         <!doctype html><html><head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <meta http-equiv="refresh" content="8;url=$WEATHER_URL">
+        <meta http-equiv="refresh" content="8;url=$retryUrl">
         <style>
             body { background: $bg; color: $fg; font-family: sans-serif; margin: 0;
                    height: 100vh; display: flex; align-items: center; justify-content: center; }
@@ -441,7 +463,7 @@ private fun errorPageHtml(isDark: Boolean, reason: String): String {
             small { opacity: .6 }
         </style>
         </head><body>
-        <a href="$WEATHER_URL">kachelmannwetter.com is unreachable<br>
+        <a href="$retryUrl">kachelmannwetter.com is unreachable<br>
         <small>$reason &middot; retrying automatically, tap to retry now</small></a>
         </body></html>
     """.trimIndent()
@@ -509,7 +531,23 @@ class MainActivity : ComponentActivity() {
         setContent {
             AppTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    WeatherWebView(modifier = Modifier.padding(innerPadding))
+                    // Read once per process: nothing else in this Activity changes it, so a
+                    // plain remembered String? (rather than re-reading SharedPreferences on
+                    // every recomposition) is enough. Null means no city has been chosen yet
+                    // -- first launch, or app data was cleared -- so the search screen shows.
+                    var cityUrl by remember { mutableStateOf(readCityUrl(this@MainActivity)) }
+                    val currentCityUrl = cityUrl
+                    if (currentCityUrl == null) {
+                        CitySearchWebView(
+                            modifier = Modifier.padding(innerPadding),
+                            onCitySelected = { url ->
+                                saveCityUrl(this@MainActivity, url)
+                                cityUrl = url
+                            },
+                        )
+                    } else {
+                        WeatherWebView(url = currentCityUrl, modifier = Modifier.padding(innerPadding))
+                    }
                 }
             }
         }
@@ -518,7 +556,7 @@ class MainActivity : ComponentActivity() {
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WeatherWebView(modifier: Modifier = Modifier) {
+fun WeatherWebView(url: String, modifier: Modifier = Modifier) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
@@ -618,7 +656,7 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                                 if (!request.isForMainFrame) return
                                 view.loadDataWithBaseURL(
                                     null,
-                                    errorPageHtml(isNightMode(view.context), error.description.toString()),
+                                    errorPageHtml(isNightMode(view.context), error.description.toString(), url),
                                     "text/html",
                                     "utf-8",
                                     null,
@@ -662,7 +700,176 @@ fun WeatherWebView(modifier: Modifier = Modifier) {
                                 swipeRefreshLayout?.isRefreshing = false
                             }
                         }
-                        loadUrl(WEATHER_URL)
+                        loadUrl(url)
+                        webView = this
+                    }
+                )
+                swipeRefreshLayout = this
+            }
+        },
+        onRelease = {
+            webView?.destroy()
+            webView = null
+        },
+    )
+}
+
+// Subset of HIDE_SELECTORS relevant on the homepage: just the CMP/overlay elements
+// (SourcePoint's welcome+consent dialog, its container, the country-detection popup).
+// Unlike WeatherWebView's HIDE_CSS, this deliberately leaves "header" (and everything
+// else) alone, since the header is exactly where the site's search box lives.
+private val SEARCH_HIDE_CSS =
+    listOf(
+        "#countrydetection",
+        ".alert-dismissible.alert-default.alert",
+        "iframe[id^=\"sp_message_iframe_\"]",
+        "div[id^=\"sp_message_container_\"]",
+        ".message-container",
+    ).joinToString(separator = ",\n") { it } + " { display: none !important; }\n"
+
+private val INJECT_SEARCH_HIDE_STYLE_JS = """
+    (function() {
+        var id = '__wetter_search_hide_style';
+        if (document.getElementById(id)) { return; }
+        var style = document.createElement('style');
+        style.id = id;
+        style.textContent = ${jsStringLiteral(SEARCH_HIDE_CSS)};
+        document.head.appendChild(style);
+    })();
+""".trimIndent()
+
+// First-launch (and city-not-yet-chosen) screen: the site's own homepage, header and
+// native search box intact, so the user can type a city and pick it from the site's
+// autocomplete exactly as they would in a browser. Once navigation lands on a per-city
+// weather page (CITY_URL_REGEX), onCitySelected fires with that URL so the caller can
+// persist it and switch to WeatherWebView.
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun CitySearchWebView(onCitySelected: (String) -> Unit, modifier: Modifier = Modifier) {
+    var webView by remember { mutableStateOf<WebView?>(null) }
+    var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
+    var canGoBack by remember { mutableStateOf(false) }
+    val haptics = LocalHapticFeedback.current
+
+    BackHandler(enabled = canGoBack) {
+        webView?.goBack()
+    }
+
+    AndroidView(
+        modifier = modifier.fillMaxSize(),
+        factory = { context ->
+            SwipeRefreshLayout(context).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+                setOnRefreshListener {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    webView?.reload()
+                }
+                addView(
+                    WebView(context).apply {
+                        layoutParams = ViewGroup.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                        )
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        val isDebuggable =
+                            context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+                        if (isDebuggable) {
+                            WebView.setWebContentsDebuggingEnabled(true)
+                        }
+                        webChromeClient = object : WebChromeClient() {
+                            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                                Log.d("Wetter", "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
+                                return false
+                            }
+                        }
+                        val isDark = isNightMode(context)
+                        val darkReaderInjectJs = if (isDark) {
+                            val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                            injectDarkReaderJs(bundle)
+                        } else {
+                            null
+                        }
+                        if (isDark) {
+                            setBackgroundColor(Color.parseColor("#000000"))
+                        }
+                        // Set once the first onPageFinished has run, so the initial
+                        // programmatic load of SEARCH_URL (and any server-side redirect
+                        // chain it goes through before settling) is never mistaken for a
+                        // user-picked city. Only navigation after that point -- an
+                        // autocomplete selection or a link tap -- should trigger selection.
+                        var initialLoadDone = false
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldOverrideUrlLoading(
+                                view: WebView,
+                                request: WebResourceRequest,
+                            ): Boolean {
+                                val url = request.url
+                                if (url.scheme == "http" || url.scheme == "https") return false
+                                return try {
+                                    view.context.startActivity(Intent(Intent.ACTION_VIEW, url))
+                                    true
+                                } catch (_: ActivityNotFoundException) {
+                                    true
+                                }
+                            }
+
+                            override fun onReceivedError(
+                                view: WebView,
+                                request: WebResourceRequest,
+                                error: WebResourceError,
+                            ) {
+                                super.onReceivedError(view, request, error)
+                                if (!request.isForMainFrame) return
+                                view.loadDataWithBaseURL(
+                                    null,
+                                    errorPageHtml(isNightMode(view.context), error.description.toString(), SEARCH_URL),
+                                    "text/html",
+                                    "utf-8",
+                                    null,
+                                )
+                            }
+
+                            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
+                                super.onPageStarted(view, url, favicon)
+                                if (initialLoadDone && url != null && CITY_URL_REGEX.containsMatchIn(url)) {
+                                    onCitySelected(url)
+                                    return
+                                }
+                                view.evaluateJavascript(INJECT_SEARCH_HIDE_STYLE_JS, null)
+                                if (darkReaderInjectJs != null) {
+                                    view.evaluateJavascript(darkReaderInjectJs, null)
+                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                                }
+                            }
+
+                            override fun onPageFinished(view: WebView, url: String?) {
+                                super.onPageFinished(view, url)
+                                // Only treat a landing as a user-picked city if it happens
+                                // on a load *after* the very first one finishes -- the
+                                // initial SEARCH_URL load (and any redirect chain leading up
+                                // to its first finish, e.g. a geolocation redirect) must
+                                // never be mistaken for a selection.
+                                val isFirstLoad = !initialLoadDone
+                                initialLoadDone = true
+                                if (!isFirstLoad && url != null && CITY_URL_REGEX.containsMatchIn(url)) {
+                                    onCitySelected(url)
+                                    return
+                                }
+                                view.evaluateJavascript(INJECT_SEARCH_HIDE_STYLE_JS, null)
+                                if (darkReaderInjectJs != null) {
+                                    view.evaluateJavascript(darkReaderInjectJs, null)
+                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                                }
+                                view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
+                                canGoBack = view.canGoBack()
+                                swipeRefreshLayout?.isRefreshing = false
+                            }
+                        }
+                        loadUrl(SEARCH_URL)
                         webView = this
                     }
                 )
