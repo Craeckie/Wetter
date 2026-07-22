@@ -64,6 +64,12 @@ workarounds on every page load:
   `body`'s inline style and re-asserts our own inline `!important` override every time the
   site (re-)locks it.
 
+  **As of the startup-speed work (see below), the SourcePoint script that applies this lock
+  is blocked at the network layer, so the lock no longer happens at all — device logcat shows
+  zero unlock reasserts and `body` reporting `static/visible/scrollable` from the first
+  frame.** `UNLOCK_SCROLL_JS` is kept as a safety net in case the CMP is ever served from a
+  host the blocklist misses.
+
 If scrolling (or similar page-behavior) breaks again, capture a log and run it through the
 analyzer:
 
@@ -102,6 +108,46 @@ Three hardening behaviors backported from the lightningmaps sibling project:
   routinely). Matches the day/night background, auto-retries via meta refresh every 8 s, and
   retries immediately on tap.
 - **Console → logcat forwarding** (see item 5 above).
+
+## Startup speed (splash + network-layer ad/CMP blocking)
+
+Two mechanisms cut cold-launch time. Both were driven by device logcat analyzed with
+`scripts/analyze_log.py`; the timeline below is the baseline they targeted.
+
+**Baseline (before, from logcat):** launch → usable ≈ **4.2 s**, split into ~0.6 s cold
+process start + ~1.6 s WebView engine init & first paint (blank screen) + ~2 s page load. The
+page load did *two* full document loads: the site's SourcePoint consent script runs, then
+reloads the whole page. That same script also applies the scroll-lock (above). **After:**
+launch → usable ≈ **2.0–2.7 s**, a single document load, zero CMP cycles, zero scroll-lock.
+
+1. **Network-layer request blocking** (`shouldInterceptRequest` in both WebViewClients →
+   `isBlockedAdHost`). Drops ad/tracker/CMP requests one level below the cosmetic
+   `INJECT_HIDE_STYLE_JS` hiding — so the WebView never spends cold-start time fetching and
+   executing scripts whose output is hidden anyway. Two match sets:
+   - `BLOCKED_AD_HOSTS` — suffix match for third-party ad/analytics hosts (DoubleClick,
+     googlesyndication, google-analytics, pflotsh, the shared SourcePoint hosts, …).
+   - `SOURCEPOINT_FIRST_PARTY_HOST` — regex `^data-c\d+\.kachelmannwetter\.com$`. The
+     SourcePoint CMP is delivered from a **first-party-cloaked CNAME subdomain**
+     (`data-c<accountId>.kachelmannwetter.com/unified/wrapperMessagingWithoutDetection.js`),
+     which a plain suffix match on `kachelmannwetter.com` would *not* want to catch. This one
+     host is what caused the redundant second page load **and** the scroll-lock; blocking it
+     removed both. Only CMP assets are served from it (weather content is on the bare domain
+     and image CDNs), so blocking the whole host is safe. Matched by shape so it survives an
+     account-id change.
+
+   To find the actual host of a script that needs blocking: `adb logcat -s Wetter` shows each
+   script's source URL (console forwarding, item 5 above).
+
+2. **Splash screen** (`androidx.core:core-splashscreen`, `Theme.App.Starting` in
+   `themes.xml`). Masks the ~1.6 s cold WebView-init + first-paint window that is otherwise a
+   blank screen. `installSplashScreen()` runs before `super.onCreate()`;
+   `setKeepOnScreenCondition { !contentReady }` holds it until the WebView reports first
+   **content paint** — `contentReady` is flipped from `WebViewClient.onPageCommitVisible`
+   (not `onPageStarted`, which fires ~0.5–0.9 s too early, at navigation start, and would drop
+   the splash onto a still-blank WebView). `onReceivedError` also flips it (so the error page
+   shows), and a 3 s `postDelayed` in `MainActivity` is the final safety net. The splash
+   background tracks light/dark via `values/` + `values-night/` `splash_background`
+   (AMOLED-black in dark, matching the WebView's own background so the hand-off is seamless).
 
 ## Local release (optional)
 

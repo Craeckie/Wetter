@@ -2,4 +2,14 @@
 <resources>
     <!-- Base application theme — used as the XML theme before Compose takes over. -->
     <style name="Theme.App" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <!-- Shown by the system (via androidx.core.splashscreen) between process start and the
+         first frame the Activity draws, masking cold WebView-engine init instead of a blank
+         white/black window. installSplashScreen() reads postSplashScreenTheme and switches
+         back to Theme.App automatically once the keep-on-screen condition clears. -->
+    <style name="Theme.App.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/splash_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@mipmap/ic_launcher</item>
+        <item name="postSplashScreenTheme">@style/Theme.App</item>
+    </style>
 </resources>

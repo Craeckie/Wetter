@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the AMOLED-black dark background used elsewhere (AppTheme's DarkColors,
+         WeatherWebView's setBackgroundColor) so the splash screen doesn't flash a lighter
+         shade right before the WebView paints. -->
+    <color name="splash_background">#000000</color>
+</resources>

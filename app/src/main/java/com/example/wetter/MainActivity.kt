@@ -14,12 +14,14 @@ import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
@@ -34,6 +36,7 @@ import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.wetter.ui.theme.AppTheme
+import java.io.ByteArrayInputStream
 
 // First-launch entry point for the city search screen -- the site's own homepage, whose
 // header carries its native city search box (with autocomplete). Once the user picks a
@@ -469,6 +472,50 @@ private fun errorPageHtml(isDark: Boolean, reason: String, retryUrl: String): St
     """.trimIndent()
 }
 
+// Ad/tracker/CMP-script domains blocked at the network layer, one level below the CSS
+// hiding in HIDE_SELECTORS -- same public-blocklist convention (uBlock uAssets/EasyList/
+// EasyPrivacy) already used there, just applied to the request instead of the rendered
+// element. This avoids spending WebView cold-start time fetching and executing scripts
+// whose output is hidden anyway. pflotsh.com is this site's own ad/promo partner (see the
+// literal href selector in HIDE_SELECTORS); the rest are standard third-party ad-serving/
+// consent-management infrastructure never used to serve the page's own content.
+private val BLOCKED_AD_HOSTS = listOf(
+    "pflotsh.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "adservice.google.de",
+    "google-analytics.com",
+    "cdn.privacy-mgmt.com",
+    "sourcepoint.mgr.consensu.org",
+)
+
+// SourcePoint's consent-management platform (CMP), delivered from a *first-party-cloaked*
+// CNAME subdomain -- data-c<accountId>.kachelmannwetter.com -- rather than one of the
+// shared SourcePoint hosts above, so a plain suffix match wouldn't catch it. WebView
+// logcat (scripts/analyze_log.py output) shows this exact script,
+// /unified/wrapperMessagingWithoutDetection.js, doing three costly things on every cold
+// launch: (a) executing on the critical path, (b) triggering a redundant *second* full
+// page load right after its first message cycle (~0.5s of the startup time), and (c)
+// applying the body scroll-lock that UNLOCK_SCROLL_JS exists to counter. Blocking the host
+// removes all three. Only SourcePoint CMP assets are ever served from this subdomain (the
+// page's own weather content comes from kachelmannwetter.com proper and the image CDNs);
+// matched by shape (data-c + digits) so it survives an account-id subdomain change.
+private val SOURCEPOINT_FIRST_PARTY_HOST = Regex("""^data-c\d+\.kachelmannwetter\.com$""")
+
+private fun isBlockedAdHost(host: String?): Boolean {
+    if (host == null) return false
+    if (SOURCEPOINT_FIRST_PARTY_HOST.matches(host)) return true
+    return BLOCKED_AD_HOSTS.any { host == it || host.endsWith(".$it") }
+}
+
+// An empty response short-circuits the request without the WebView falling back to a
+// network error page for it -- fine here since only subresources (never the main frame
+// document itself) are ever matched against BLOCKED_AD_HOSTS.
+private fun blockedAdResponse(): WebResourceResponse =
+    WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
+
 private fun jsStringLiteral(value: String): String {
     val escaped = value
         .replace("\\", "\\\\")
@@ -525,8 +572,23 @@ private val SCROLL_WATCH_JS = """
 """.trimIndent()
 
 class MainActivity : ComponentActivity() {
+    // Polled by the splash screen (see setKeepOnScreenCondition below); flips once the
+    // WebView paints its first frame of actual page content (onPageCommitVisible), so the
+    // splash bridges the whole cold process + WebView-engine init + first-paint window
+    // instead of handing off to a still-blank WebView partway through.
+    @Volatile
+    private var contentReady = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Must run before super.onCreate() so it can install itself before the window's
+        // first frame is drawn.
+        val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        splashScreen.setKeepOnScreenCondition { !contentReady }
+        // Safety net: if the WebView never reports back (unexpected load-path failure),
+        // don't hold the splash forever -- 3s covers cold WebView init with room to spare
+        // without meaningfully compounding a genuinely stuck load.
+        window.decorView.postDelayed({ contentReady = true }, 3000)
         enableEdgeToEdge()
         setContent {
             AppTheme {
@@ -544,9 +606,14 @@ class MainActivity : ComponentActivity() {
                                 saveCityUrl(this@MainActivity, url)
                                 cityUrl = url
                             },
+                            onContentStarted = { contentReady = true },
                         )
                     } else {
-                        WeatherWebView(url = currentCityUrl, modifier = Modifier.padding(innerPadding))
+                        WeatherWebView(
+                            url = currentCityUrl,
+                            modifier = Modifier.padding(innerPadding),
+                            onContentStarted = { contentReady = true },
+                        )
                     }
                 }
             }
@@ -556,7 +623,7 @@ class MainActivity : ComponentActivity() {
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun WeatherWebView(url: String, modifier: Modifier = Modifier) {
+fun WeatherWebView(url: String, modifier: Modifier = Modifier, onContentStarted: () -> Unit = {}) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
     // canGoBack() is a plain method call, not Compose state, so it must be mirrored
@@ -645,12 +712,23 @@ fun WeatherWebView(url: String, modifier: Modifier = Modifier) {
                                 }
                             }
 
+                            override fun shouldInterceptRequest(
+                                view: WebView,
+                                request: WebResourceRequest,
+                            ): WebResourceResponse? {
+                                if (isBlockedAdHost(request.url.host)) {
+                                    return blockedAdResponse()
+                                }
+                                return super.shouldInterceptRequest(view, request)
+                            }
+
                             override fun onReceivedError(
                                 view: WebView,
                                 request: WebResourceRequest,
                                 error: WebResourceError,
                             ) {
                                 super.onReceivedError(view, request, error)
+                                onContentStarted()
                                 // Subresources (ads, trackers) fail all the time — only a failed
                                 // main document warrants the error screen.
                                 if (!request.isForMainFrame) return
@@ -661,6 +739,18 @@ fun WeatherWebView(url: String, modifier: Modifier = Modifier) {
                                     "utf-8",
                                     null,
                                 )
+                            }
+
+                            // Fires when the WebView paints the first frame of actual page
+                            // content -- the correct moment to hand off from the splash screen.
+                            // onPageStarted (navigation start) fires ~0.5-0.9s earlier per the
+                            // device logcat, which would drop the splash while the WebView was
+                            // still blank; onPageCommitVisible dismisses it exactly as content
+                            // appears. onReceivedError covers the failed-load path, and the 3s
+                            // timeout in MainActivity is the final safety net.
+                            override fun onPageCommitVisible(view: WebView, url: String?) {
+                                super.onPageCommitVisible(view, url)
+                                onContentStarted()
                             }
 
                             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
@@ -745,7 +835,11 @@ private val INJECT_SEARCH_HIDE_STYLE_JS = """
 // persist it and switch to WeatherWebView.
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun CitySearchWebView(onCitySelected: (String) -> Unit, modifier: Modifier = Modifier) {
+fun CitySearchWebView(
+    onCitySelected: (String) -> Unit,
+    modifier: Modifier = Modifier,
+    onContentStarted: () -> Unit = {},
+) {
     var webView by remember { mutableStateOf<WebView?>(null) }
     var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
@@ -817,12 +911,23 @@ fun CitySearchWebView(onCitySelected: (String) -> Unit, modifier: Modifier = Mod
                                 }
                             }
 
+                            override fun shouldInterceptRequest(
+                                view: WebView,
+                                request: WebResourceRequest,
+                            ): WebResourceResponse? {
+                                if (isBlockedAdHost(request.url.host)) {
+                                    return blockedAdResponse()
+                                }
+                                return super.shouldInterceptRequest(view, request)
+                            }
+
                             override fun onReceivedError(
                                 view: WebView,
                                 request: WebResourceRequest,
                                 error: WebResourceError,
                             ) {
                                 super.onReceivedError(view, request, error)
+                                onContentStarted()
                                 if (!request.isForMainFrame) return
                                 view.loadDataWithBaseURL(
                                     null,
@@ -831,6 +936,13 @@ fun CitySearchWebView(onCitySelected: (String) -> Unit, modifier: Modifier = Mod
                                     "utf-8",
                                     null,
                                 )
+                            }
+
+                            // See WeatherWebView.onPageCommitVisible: first-content-paint is
+                            // the right splash hand-off point, not navigation start.
+                            override fun onPageCommitVisible(view: WebView, url: String?) {
+                                super.onPageCommitVisible(view, url)
+                                onContentStarted()
                             }
 
                             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
