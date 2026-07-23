@@ -63,7 +63,7 @@ Reordered after the 2026-07-23 capture. The "Plan" column maps to the plans belo
 | DNS + preconnect warm-up | A.1 | Low | Small–Med | Trims part of the ~950 ms page-load window; the city host is known at process start (stored URL) |
 | Baseline Profile (hand-written) | A.2 | Low–Med | Modest, ships to real users | Self-contained `:baselineprofile` module add |
 | `WebViewCompat.addDocumentStartJavaScript` | A.3 | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
-| `BundleCache` disk cache | D | Med | **Unknown — gated on investigation** | Only worth it if kachelmann serves version-stamped immutable bundles (see Open questions) |
+| ~~`BundleCache` disk cache~~ | ~~D~~ | — | **Dropped (measured).** Chromium already caches every bundle with no revalidation; see Open questions | — |
 | Remove Dark Reader → rely on site's own dark theme | **B** | Med | **Not a cold-start lever (measured 6–8 ms).** APK −340 KB, memory, renderer CPU, and pure waste on launch #2+ | Demoted from the first draft's "highest"; still worth doing as cleanup |
 | `uiMode` in `configChanges` + rebuild | E | Low–Med | Small | day/night flip is rare; today it triggers a full activity recreate |
 
@@ -116,11 +116,12 @@ Conclusions:
 
 1. **Size of the Dark Reader main-thread cost.** ✅ **Answered 2026-07-23: 6–8 ms, negligible.**
    See Measured baseline above.
-2. **BundleCache feasibility (Plan D).** Still open. Needs the site's JS/CSS request URLs + cache headers.
-   The saved reference page (`scripts/reference-local/…`) has all assets inlined, so it can't
-   answer this — only a live capture can. Build Plan D **only if** kachelmann serves
-   version-stamped immutable bundles (like lightningmaps' `/min/?f=…&<stamp>`); if it's plain
-   filenames on normal HTTP caching, Chromium already handles it and Plan D is dropped.
+2. **BundleCache feasibility (Plan D).** ✅ **Answered 2026-07-23: dropped.** The
+   `RESOURCE_TIMING_DUMP_JS` capture showed **every same-origin bundle at `transfer: 0` on cold
+   launch #2** — Chromium serves them all from its own HTTP cache with *no* revalidation
+   round-trip. The site version-stamps its asset URLs (`?v3.42`, `?v4.2g`, Yii content-hash dirs
+   like `/assets/c6acb98a/`), so the browser cache stays valid across builds. An app-level disk
+   cache would only duplicate what Chromium already does. Plan D removed.
 3. **Startup baseline to order the plans.** ✅ **Answered 2026-07-23** (Measured baseline above):
    Compose/WebView-init dominates the app-side window, so Plan C leads.
 
@@ -185,10 +186,12 @@ construction). lightningmaps builds the WebView directly in `onCreate`; wetter w
   startup win. Highest payoff, highest risk.
 - **Synergy**: doing Plan B first means the unified builder carries no Dark-Reader branch across.
 
-### Plan D — BundleCache (gated on investigation)
-Do not build until the capture (below) shows kachelmann serves version-stamped, immutable bundles.
-If so, port `BundleCache.kt` with an `isCacheableBundle` matcher for kachelmann's URL shape and an
-allowlist for the site + image CDNs. If not, drop it.
+### ~~Plan D — BundleCache~~ (dropped, measured 2026-07-23)
+Investigated and dropped: Chromium already caches all of the site's version-stamped bundles from
+disk with no revalidation (`transfer: 0` on cold launch #2 — see Open questions #2). An app-level
+disk cache would add nothing. Unlike lightningmaps' Minify combiner, kachelmann already ships
+cache-friendly asset URLs. Re-check with `RESOURCE_TIMING_DUMP_JS` if the site's caching ever
+regresses (bundles showing `transfer > 0` on repeat launches).
 
 ### Plan E — `uiMode` in `configChanges`
 Fold into Plan C: once `onCreate` owns the WebView, add `uiMode` to `android:configChanges` and
@@ -197,11 +200,23 @@ activity teardown. Small, rare-path win; cheap once Compose is gone.
 
 ## Recommended sequencing
 
-Revised after measurement: **0 → A → C → B**, with D spun off only if the capture justifies it,
-and E folded into C. **Plan C is the top cold-start lever** — start there once the low-risk Plan A
-batch is in. Plan A.1 (warm-up) is the cheapest trim of the page-load window. Plan B drops to
-cleanup and can land any time. Semver: these are optimizations, so patch bumps (e.g. 1.2.1 →
-1.2.2) unless a plan adds a user-visible feature.
+Revised after measurement: **0 → A → C → B**, with **D dropped** and E folded into C. **Plan C is
+the top cold-start lever** — start there once the low-risk Plan A batch is in. Plan A.1 (warm-up)
+is the cheapest trim of the page-load window. Plan B drops to cleanup and can land any time.
+Semver: these are optimizations, so patch bumps (e.g. 1.2.1 → 1.2.2) unless a plan adds a
+user-visible feature.
+
+## Backlog (not yet a plan)
+
+- **The page ships ~2.5 MB of decoded JS.** The `RESOURCE_TIMING_DUMP_JS` capture (2026-07-23)
+  showed `graph.js?v2.82` at **1.5 MB decoded** (Highcharts), plus `function.js` ~500 KB and
+  `compact.js` ~390 KB. Parsing/executing that is a real slice of the ~950 ms page-load window —
+  and far larger than the Dark Reader cost that first looked like the lever. The charts it powers
+  render *below the fold* (the reorder puts the 12-hour overview first, radar, then future-day
+  charts). Deferring or lazy-loading the heavy chart script until after first paint could cut
+  time-to-first-paint, but it's a site-behavior change we'd have to force via injection (risky,
+  and it fights the site's own script ordering) — needs experimentation before it's a plan.
+  This is likely the biggest remaining page-load lever after Compose removal.
 
 ## Instrumentation (debug builds only)
 
