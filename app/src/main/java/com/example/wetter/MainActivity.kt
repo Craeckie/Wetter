@@ -572,6 +572,35 @@ private val SCROLL_WATCH_JS = """
     })();
 """.trimIndent()
 
+// Debug-only: dumps the page's JS/CSS resource loads (URL + Resource Timing sizes) to the
+// console -> logcat, one `__wetter_res__` JSON line each. Answers the BundleCache question
+// (Plan D, docs/startup-performance.md) from adb alone -- no chrome://inspect needed:
+//   - transfer=0 on a *same-origin* bundle => Chromium already served it from its own HTTP
+//     cache (so an app-level disk cache would add little); transfer>0 => re-downloaded this load.
+//   - the URL reveals whether bundles are version-stamped/immutable (safe to cache forever).
+// Capture two cold launches and compare launch #2's `transfer` for kachelmann's own bundles:
+//   adb logcat -s Wetter | grep __wetter_res__
+private val RESOURCE_TIMING_DUMP_JS = """
+    (function() {
+        try {
+            var origin = location.origin;
+            performance.getEntriesByType('resource').forEach(function(e) {
+                var isAsset = e.initiatorType === 'script' || e.initiatorType === 'link' ||
+                    /\.(js|css)(\?|#|${'$'})/i.test(e.name);
+                if (!isAsset) { return; }
+                console.log('__wetter_res__ ' + JSON.stringify({
+                    url: e.name,
+                    sameOrigin: e.name.indexOf(origin) === 0,
+                    init: e.initiatorType,
+                    transfer: Math.round(e.transferSize || 0),
+                    enc: Math.round(e.encodedBodySize || 0),
+                    dec: Math.round(e.decodedBodySize || 0),
+                }));
+            });
+        } catch (err) {}
+    })();
+""".trimIndent()
+
 class MainActivity : ComponentActivity() {
     // Polled by the splash screen (see setKeepOnScreenCondition below); flips once the
     // WebView paints its first frame of actual page content (onPageCommitVisible), so the
@@ -800,6 +829,7 @@ fun WeatherWebView(url: String, modifier: Modifier = Modifier, onContentStarted:
                                 view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
                                 if (isDebuggable) {
                                     view.evaluateJavascript(SCROLL_WATCH_JS, null)
+                                    view.evaluateJavascript(RESOURCE_TIMING_DUMP_JS, null)
                                 }
                                 canGoBack = view.canGoBack()
                                 swipeRefreshLayout?.isRefreshing = false
