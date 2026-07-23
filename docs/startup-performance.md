@@ -185,8 +185,22 @@ which rendered nothing behind the full-screen WebView. Dropped `activity-compose
 `material3`, `foundation`, `ui*`, `kotlin.plugin.compose` from both `build.gradle.kts` files.
 Version bumped 1.2.1 → 1.2.2 (patch: optimization, no user-facing feature). Both `assembleDebug`
 and `assembleRelease` (incl. R8 minify/shrink and lint-vital) build clean.
-**Not yet re-measured on device** — re-run `scripts/capture-startup.sh` and compare against the
-committed baseline above to confirm the `onCreate`→first-paint window actually shrank.
+**Re-measured on device 2026-07-23** (5 cold launches, dark mode, `capture-startup.sh`-style
+capture). Medians of launches 2–5 (launch 1 discarded — cold-cache-dominated, same convention
+lightningmaps uses) against the committed Compose-era dark baseline above:
+
+| Milestone | Before (Compose) | After (this capture) | Δ |
+|---|---|---|---|
+| `onCreate` (fork→onCreate) | 343ms | 164ms | **−52%** |
+| `onCreate` → first frame | 1078ms | 644ms | **−40%** |
+| first paint (`onPageCommitVisible`) | 1785ms | 1402ms | **−21%** |
+| `Displayed` (am's own metric) | 1925ms | 1591ms | **−17%** |
+
+The biggest relative win lands exactly where Compose composition used to sit
+(`onCreate`→first-frame, −40%) and decays gracefully downstream — every milestone improved, in
+the right order of magnitude. **Caveat:** single session, no interleaved A/B against a rebuilt
+Compose APK (lightningmaps' gold-standard method), so treat the exact percentages as directional
+rather than final; the direction and magnitude are consistent with the hypothesis either way.
 
 ### ~~Plan D — BundleCache~~ (dropped, measured 2026-07-23)
 Investigated and dropped: Chromium already caches all of the site's version-stamped bundles from
