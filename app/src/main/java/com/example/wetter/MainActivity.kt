@@ -4,11 +4,13 @@ import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Bundle
 import android.util.Log
+import android.view.HapticFeedbackConstants
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
@@ -18,24 +20,12 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
-import androidx.activity.compose.BackHandler
-import androidx.activity.compose.setContent
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
-import com.example.wetter.ui.theme.AppTheme
 import java.io.ByteArrayInputStream
 import kotlin.system.measureTimeMillis
 
@@ -526,8 +516,9 @@ private fun jsStringLiteral(value: String): String {
 }
 
 // Whether the system is currently in night mode, read live off the WebView's context so
-// it reflects the setting at the time of each page load (the activity restarts on a
-// system theme change, since uiMode isn't declared in android:configChanges).
+// it reflects the setting at the time of each page load. uiMode IS declared in
+// android:configChanges (see MainActivity.onConfigurationChanged), so a system theme
+// change no longer restarts the activity -- it rebuilds just the WebView instead.
 private fun isNightMode(context: Context): Boolean =
     (context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
         Configuration.UI_MODE_NIGHT_YES
@@ -601,257 +592,9 @@ private val RESOURCE_TIMING_DUMP_JS = """
     })();
 """.trimIndent()
 
-class MainActivity : ComponentActivity() {
-    // Polled by the splash screen (see setKeepOnScreenCondition below); flips once the
-    // WebView paints its first frame of actual page content (onPageCommitVisible), so the
-    // splash bridges the whole cold process + WebView-engine init + first-paint window
-    // instead of handing off to a still-blank WebView partway through.
-    @Volatile
-    private var contentReady = false
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        // Must run before super.onCreate() so it can install itself before the window's
-        // first frame is drawn.
-        val splashScreen = installSplashScreen()
-        super.onCreate(savedInstanceState)
-        // Cold-start markers (debug builds only). The decorView.post lands after onCreate
-        // returns and the first traversal is scheduled, so it brackets onCreate's own cost.
-        val debug = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
-        StartupTrace.log(debug, "MainActivity.onCreate")
-        window.decorView.post { StartupTrace.log(debug, "MainActivity.onCreate returned") }
-        splashScreen.setKeepOnScreenCondition { !contentReady }
-        // Safety net: if the WebView never reports back (unexpected load-path failure),
-        // don't hold the splash forever -- 3s covers cold WebView init with room to spare
-        // without meaningfully compounding a genuinely stuck load.
-        window.decorView.postDelayed({ contentReady = true }, 3000)
-        enableEdgeToEdge()
-        setContent {
-            AppTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    // Read once per process: nothing else in this Activity changes it, so a
-                    // plain remembered String? (rather than re-reading SharedPreferences on
-                    // every recomposition) is enough. Null means no city has been chosen yet
-                    // -- first launch, or app data was cleared -- so the search screen shows.
-                    var cityUrl by remember { mutableStateOf(readCityUrl(this@MainActivity)) }
-                    val currentCityUrl = cityUrl
-                    if (currentCityUrl == null) {
-                        CitySearchWebView(
-                            modifier = Modifier.padding(innerPadding),
-                            onCitySelected = { url ->
-                                saveCityUrl(this@MainActivity, url)
-                                cityUrl = url
-                            },
-                            onContentStarted = { contentReady = true },
-                        )
-                    } else {
-                        WeatherWebView(
-                            url = currentCityUrl,
-                            modifier = Modifier.padding(innerPadding),
-                            onContentStarted = { contentReady = true },
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-fun WeatherWebView(url: String, modifier: Modifier = Modifier, onContentStarted: () -> Unit = {}) {
-    var webView by remember { mutableStateOf<WebView?>(null) }
-    var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
-    // canGoBack() is a plain method call, not Compose state, so it must be mirrored
-    // into a State explicitly (updated on every navigation) for BackHandler to react
-    // to in-page navigation instead of latching to the value from first composition.
-    var canGoBack by remember { mutableStateOf(false) }
-    val haptics = LocalHapticFeedback.current
-
-    BackHandler(enabled = canGoBack) {
-        webView?.goBack()
-    }
-
-    AndroidView(
-        modifier = modifier.fillMaxSize(),
-        factory = { context ->
-            SwipeRefreshLayout(context).apply {
-                // Compose's AndroidView holder adds the factory view without LayoutParams, so
-                // it would get the ViewGroup default WRAP_CONTENT. A WebView whose
-                // layoutParams.height is WRAP_CONTENT switches Chromium into grow-with-content
-                // mode, where CSS percentage heights resolve against zero (found the hard way
-                // in the lightningmaps sibling, where the page collapsed to its min-height
-                // floors). This app currently survives because SwipeRefreshLayout measures its
-                // child with exact specs — but set MATCH_PARENT explicitly on both views so
-                // correct sizing doesn't hinge on that wrapper implementation detail.
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                )
-                setOnRefreshListener {
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                    webView?.reload()
-                }
-                addView(
-                    WebView(context).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                        )
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        // Lets the live page be inspected via chrome://inspect on a connected
-                        // computer, e.g. to diagnose why an injected CSS rule breaks scrolling.
-                        val isDebuggable =
-                            context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
-                        if (isDebuggable) {
-                            WebView.setWebContentsDebuggingEnabled(true)
-                        }
-                        // Page console → logcat, so injection state is visible via
-                        // `adb logcat -s Wetter` even without a chrome://inspect session.
-                        // Returns false (unlike the lightningmaps sibling) so chromium still
-                        // emits its own "[INFO:CONSOLE]" lines — scripts/analyze_log.py greps
-                        // for those.
-                        webChromeClient = object : WebChromeClient() {
-                            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                                Log.d("Wetter", "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
-                                return false
-                            }
-                        }
-                        val isDark = isNightMode(context)
-                        // Loaded once per WebView instance rather than per navigation.
-                        val darkReaderInjectJs = if (isDark) {
-                            // Timed because this read+decode of the 340 KB bundle happens on the
-                            // main thread during the AndroidView factory -- the night-mode-only
-                            // cost Plan B (docs/startup-performance.md) targets. Debug-only log.
-                            var bundle = ""
-                            val readMs = measureTimeMillis {
-                                bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
-                            }
-                            StartupTrace.log(isDebuggable, "read darkreader.js: ${bundle.length} chars in ${readMs}ms on main thread")
-                            injectDarkReaderJs(bundle)
-                        } else {
-                            null
-                        }
-                        if (isDark) {
-                            // Avoids a white flash of the WebView's own surface before the page
-                            // has painted and Dark Reader has kicked in.
-                            setBackgroundColor(Color.parseColor("#000000"))
-                        }
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldOverrideUrlLoading(
-                                view: WebView,
-                                request: WebResourceRequest,
-                            ): Boolean {
-                                val url = request.url
-                                if (url.scheme == "http" || url.scheme == "https") return false
-                                // Non-http(s) links (mailto:, tel:, intent:, ...) can't be
-                                // loaded by the WebView itself; hand them to the system.
-                                return try {
-                                    view.context.startActivity(Intent(Intent.ACTION_VIEW, url))
-                                    true
-                                } catch (_: ActivityNotFoundException) {
-                                    true
-                                }
-                            }
-
-                            override fun shouldInterceptRequest(
-                                view: WebView,
-                                request: WebResourceRequest,
-                            ): WebResourceResponse? {
-                                if (isBlockedAdHost(request.url.host)) {
-                                    return blockedAdResponse()
-                                }
-                                return super.shouldInterceptRequest(view, request)
-                            }
-
-                            override fun onReceivedError(
-                                view: WebView,
-                                request: WebResourceRequest,
-                                error: WebResourceError,
-                            ) {
-                                super.onReceivedError(view, request, error)
-                                onContentStarted()
-                                // Subresources (ads, trackers) fail all the time — only a failed
-                                // main document warrants the error screen.
-                                if (!request.isForMainFrame) return
-                                view.loadDataWithBaseURL(
-                                    null,
-                                    errorPageHtml(isNightMode(view.context), error.description.toString(), url),
-                                    "text/html",
-                                    "utf-8",
-                                    null,
-                                )
-                            }
-
-                            // Fires when the WebView paints the first frame of actual page
-                            // content -- the correct moment to hand off from the splash screen.
-                            // onPageStarted (navigation start) fires ~0.5-0.9s earlier per the
-                            // device logcat, which would drop the splash while the WebView was
-                            // still blank; onPageCommitVisible dismisses it exactly as content
-                            // appears. onReceivedError covers the failed-load path, and the 3s
-                            // timeout in MainActivity is the final safety net.
-                            override fun onPageCommitVisible(view: WebView, url: String?) {
-                                super.onPageCommitVisible(view, url)
-                                StartupTrace.log(isDebuggable, "onPageCommitVisible (first paint)")
-                                onContentStarted()
-                            }
-
-                            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
-                                super.onPageStarted(view, url, favicon)
-                                view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
-                                if (darkReaderInjectJs != null) {
-                                    view.evaluateJavascript(darkReaderInjectJs, null)
-                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
-                                }
-                            }
-
-                            override fun onPageFinished(view: WebView, url: String?) {
-                                super.onPageFinished(view, url)
-                                StartupTrace.log(isDebuggable, "onPageFinished (weather)")
-                                // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging
-                                // is active by the time it runs (and stays off in release builds).
-                                if (isDebuggable) {
-                                    view.evaluateJavascript("window.__wetterDebug = true;", null)
-                                }
-                                view.evaluateJavascript(INJECT_HIDE_STYLE_JS, null)
-                                view.evaluateJavascript(CLASSIFY_MODEL_BUTTONS_JS, null)
-                                if (darkReaderInjectJs != null) {
-                                    // Re-asserted after load, same as the hide style above, in case
-                                    // late page scripts touched <head> after our first injection. The
-                                    // "if (!window.DarkReader)" guard keeps this from re-parsing the
-                                    // ~346KB bundle a second time within the same document.
-                                    view.evaluateJavascript(darkReaderInjectJs, null)
-                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
-                                }
-                                if (darkReaderInjectJs != null) {
-                                    view.evaluateJavascript(AUTO_SITE_DARK_JS, null)
-                                }
-                                view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
-                                if (isDebuggable) {
-                                    view.evaluateJavascript(SCROLL_WATCH_JS, null)
-                                    view.evaluateJavascript(RESOURCE_TIMING_DUMP_JS, null)
-                                }
-                                canGoBack = view.canGoBack()
-                                swipeRefreshLayout?.isRefreshing = false
-                            }
-                        }
-                        loadUrl(url)
-                        webView = this
-                    }
-                )
-                swipeRefreshLayout = this
-            }
-        },
-        onRelease = {
-            webView?.destroy()
-            webView = null
-        },
-    )
-}
-
 // Subset of HIDE_SELECTORS relevant on the homepage: just the CMP/overlay elements
 // (SourcePoint's welcome+consent dialog, its container, the country-detection popup).
-// Unlike WeatherWebView's HIDE_CSS, this deliberately leaves "header" (and everything
+// Unlike the weather screen's HIDE_CSS, this deliberately leaves "header" (and everything
 // else) alone, since the header is exactly where the site's search box lives.
 private val SEARCH_HIDE_CSS =
     listOf(
@@ -873,178 +616,353 @@ private val INJECT_SEARCH_HIDE_STYLE_JS = """
     })();
 """.trimIndent()
 
-// First-launch (and city-not-yet-chosen) screen: the site's own homepage, header and
-// native search box intact, so the user can type a city and pick it from the site's
-// autocomplete exactly as they would in a browser. Once navigation lands on a per-city
-// weather page (CITY_URL_REGEX), onCitySelected fires with that URL so the caller can
-// persist it and switch to WeatherWebView.
-@SuppressLint("SetJavaScriptEnabled")
-@Composable
-fun CitySearchWebView(
-    onCitySelected: (String) -> Unit,
-    modifier: Modifier = Modifier,
-    onContentStarted: () -> Unit = {},
-) {
-    var webView by remember { mutableStateOf<WebView?>(null) }
-    var swipeRefreshLayout by remember { mutableStateOf<SwipeRefreshLayout?>(null) }
-    var canGoBack by remember { mutableStateOf(false) }
-    val haptics = LocalHapticFeedback.current
+// A built screen: the SwipeRefreshLayout root (what gets passed to setContentView) plus
+// its WebView, so the caller can loadUrl/goBack/destroy without an extra findViewById.
+private class WebScreen(val root: SwipeRefreshLayout, val webView: WebView)
 
-    BackHandler(enabled = canGoBack) {
-        webView?.goBack()
+// Builds one full-screen WebView wrapped in pull-to-refresh -- either the site's own
+// homepage (search box + autocomplete, isSearch=true) or a per-city weather page
+// (isSearch=false). The two screens share every WebView workaround (ad blocking, hide
+// CSS, Dark Reader, scroll-unlock, error page, console forwarding); isSearch only
+// switches the hide-CSS variant and arms the CITY_URL_REGEX city-detection watch that
+// calls onCitySelected once the user's search lands on a real city page.
+//
+// Does NOT call loadUrl itself -- the caller does that after wiring up window-inset
+// handling, matching the lightningmaps sibling's createWebView/installWebView split.
+@SuppressLint("SetJavaScriptEnabled")
+private fun createWebScreen(
+    activity: MainActivity,
+    isSearch: Boolean,
+    url: String,
+    isNight: Boolean,
+    onContentReady: () -> Unit,
+    onCitySelected: (String) -> Unit,
+): WebScreen {
+    val context: Context = activity
+    var webViewRef: WebView? = null
+
+    val swipeRefreshLayout = SwipeRefreshLayout(context).apply {
+        // Compose's AndroidView holder used to add the factory view without LayoutParams,
+        // leaving it at the ViewGroup default WRAP_CONTENT; setContentView doesn't have that
+        // failure mode, but the explicit MATCH_PARENT stays so correct sizing doesn't depend
+        // on any wrapper implementation detail (see the matching comment on the WebView below,
+        // and the lightningmaps sibling's docs).
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        setOnRefreshListener {
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            webViewRef?.reload()
+        }
     }
 
-    AndroidView(
-        modifier = modifier.fillMaxSize(),
-        factory = { context ->
-            SwipeRefreshLayout(context).apply {
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                )
-                setOnRefreshListener {
-                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-                    webView?.reload()
-                }
-                addView(
-                    WebView(context).apply {
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                        )
-                        settings.javaScriptEnabled = true
-                        settings.domStorageEnabled = true
-                        val isDebuggable =
-                            context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
-                        if (isDebuggable) {
-                            WebView.setWebContentsDebuggingEnabled(true)
-                        }
-                        webChromeClient = object : WebChromeClient() {
-                            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
-                                Log.d("Wetter", "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
-                                return false
-                            }
-                        }
-                        val isDark = isNightMode(context)
-                        val darkReaderInjectJs = if (isDark) {
-                            // Timed because this read+decode of the 340 KB bundle happens on the
-                            // main thread during the AndroidView factory -- the night-mode-only
-                            // cost Plan B (docs/startup-performance.md) targets. Debug-only log.
-                            var bundle = ""
-                            val readMs = measureTimeMillis {
-                                bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
-                            }
-                            StartupTrace.log(isDebuggable, "read darkreader.js: ${bundle.length} chars in ${readMs}ms on main thread")
-                            injectDarkReaderJs(bundle)
-                        } else {
-                            null
-                        }
-                        if (isDark) {
-                            setBackgroundColor(Color.parseColor("#000000"))
-                        }
-                        // Set once the first onPageFinished has run, so the initial
-                        // programmatic load of SEARCH_URL (and any server-side redirect
-                        // chain it goes through before settling) is never mistaken for a
-                        // user-picked city. Only navigation after that point -- an
-                        // autocomplete selection or a link tap -- should trigger selection.
-                        var initialLoadDone = false
-                        webViewClient = object : WebViewClient() {
-                            override fun shouldOverrideUrlLoading(
-                                view: WebView,
-                                request: WebResourceRequest,
-                            ): Boolean {
-                                val url = request.url
-                                if (url.scheme == "http" || url.scheme == "https") return false
-                                return try {
-                                    view.context.startActivity(Intent(Intent.ACTION_VIEW, url))
-                                    true
-                                } catch (_: ActivityNotFoundException) {
-                                    true
-                                }
-                            }
-
-                            override fun shouldInterceptRequest(
-                                view: WebView,
-                                request: WebResourceRequest,
-                            ): WebResourceResponse? {
-                                if (isBlockedAdHost(request.url.host)) {
-                                    return blockedAdResponse()
-                                }
-                                return super.shouldInterceptRequest(view, request)
-                            }
-
-                            override fun onReceivedError(
-                                view: WebView,
-                                request: WebResourceRequest,
-                                error: WebResourceError,
-                            ) {
-                                super.onReceivedError(view, request, error)
-                                onContentStarted()
-                                if (!request.isForMainFrame) return
-                                view.loadDataWithBaseURL(
-                                    null,
-                                    errorPageHtml(isNightMode(view.context), error.description.toString(), SEARCH_URL),
-                                    "text/html",
-                                    "utf-8",
-                                    null,
-                                )
-                            }
-
-                            // See WeatherWebView.onPageCommitVisible: first-content-paint is
-                            // the right splash hand-off point, not navigation start.
-                            override fun onPageCommitVisible(view: WebView, url: String?) {
-                                super.onPageCommitVisible(view, url)
-                                StartupTrace.log(isDebuggable, "onPageCommitVisible (first paint)")
-                                onContentStarted()
-                            }
-
-                            override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
-                                super.onPageStarted(view, url, favicon)
-                                if (initialLoadDone && url != null && CITY_URL_REGEX.containsMatchIn(url)) {
-                                    onCitySelected(url)
-                                    return
-                                }
-                                view.evaluateJavascript(INJECT_SEARCH_HIDE_STYLE_JS, null)
-                                if (darkReaderInjectJs != null) {
-                                    view.evaluateJavascript(darkReaderInjectJs, null)
-                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
-                                }
-                            }
-
-                            override fun onPageFinished(view: WebView, url: String?) {
-                                super.onPageFinished(view, url)
-                                StartupTrace.log(isDebuggable, "onPageFinished (search)")
-                                // Only treat a landing as a user-picked city if it happens
-                                // on a load *after* the very first one finishes -- the
-                                // initial SEARCH_URL load (and any redirect chain leading up
-                                // to its first finish, e.g. a geolocation redirect) must
-                                // never be mistaken for a selection.
-                                val isFirstLoad = !initialLoadDone
-                                initialLoadDone = true
-                                if (!isFirstLoad && url != null && CITY_URL_REGEX.containsMatchIn(url)) {
-                                    onCitySelected(url)
-                                    return
-                                }
-                                view.evaluateJavascript(INJECT_SEARCH_HIDE_STYLE_JS, null)
-                                if (darkReaderInjectJs != null) {
-                                    view.evaluateJavascript(darkReaderInjectJs, null)
-                                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
-                                }
-                                view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
-                                canGoBack = view.canGoBack()
-                                swipeRefreshLayout?.isRefreshing = false
-                            }
-                        }
-                        loadUrl(SEARCH_URL)
-                        webView = this
-                    }
-                )
-                swipeRefreshLayout = this
+    val webView = WebView(context).apply {
+        layoutParams = ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT,
+        )
+        settings.javaScriptEnabled = true
+        settings.domStorageEnabled = true
+        // Lets the live page be inspected via chrome://inspect on a connected computer,
+        // e.g. to diagnose why an injected CSS rule breaks scrolling.
+        val isDebuggable = context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        if (isDebuggable) {
+            WebView.setWebContentsDebuggingEnabled(true)
+        }
+        // Page console -> logcat, so injection state is visible via
+        // `adb logcat -s Wetter` even without a chrome://inspect session. Returns false
+        // (unlike the lightningmaps sibling) so chromium still emits its own
+        // "[INFO:CONSOLE]" lines -- scripts/analyze_log.py greps for those.
+        webChromeClient = object : WebChromeClient() {
+            override fun onConsoleMessage(msg: ConsoleMessage): Boolean {
+                Log.d("Wetter", "${msg.message()} (${msg.sourceId()}:${msg.lineNumber()})")
+                return false
             }
-        },
-        onRelease = {
-            webView?.destroy()
-            webView = null
-        },
-    )
+        }
+        // Loaded once per WebView instance rather than per navigation.
+        val darkReaderInjectJs = if (isNight) {
+            // Timed because this read+decode of the 340 KB bundle happens on the main
+            // thread during WebView construction -- measured at 6-8ms (see
+            // docs/startup-performance.md, Plan B), not a cold-start cost, but still worth
+            // tracking if the bundle ever grows. Debug-only log.
+            var bundle = ""
+            val readMs = measureTimeMillis {
+                bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+            }
+            StartupTrace.log(isDebuggable, "read darkreader.js: ${bundle.length} chars in ${readMs}ms on main thread")
+            injectDarkReaderJs(bundle)
+        } else {
+            null
+        }
+        if (isNight) {
+            // Avoids a white flash of the WebView's own surface before the page has
+            // painted and Dark Reader (or the site's own dark theme) has kicked in.
+            setBackgroundColor(Color.parseColor("#000000"))
+        }
+        // Set once the first onPageFinished has run, so the initial programmatic load of
+        // SEARCH_URL (and any server-side redirect chain it goes through before settling)
+        // is never mistaken for a user-picked city. Only meaningful when isSearch; unused
+        // (stays false) on the weather screen.
+        var initialLoadDone = false
+        webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(
+                view: WebView,
+                request: WebResourceRequest,
+            ): Boolean {
+                val target = request.url
+                if (target.scheme == "http" || target.scheme == "https") return false
+                // Non-http(s) links (mailto:, tel:, intent:, ...) can't be loaded by the
+                // WebView itself; hand them to the system.
+                return try {
+                    view.context.startActivity(Intent(Intent.ACTION_VIEW, target))
+                    true
+                } catch (_: ActivityNotFoundException) {
+                    true
+                }
+            }
+
+            override fun shouldInterceptRequest(
+                view: WebView,
+                request: WebResourceRequest,
+            ): WebResourceResponse? {
+                if (isBlockedAdHost(request.url.host)) {
+                    return blockedAdResponse()
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
+            override fun onReceivedError(
+                view: WebView,
+                request: WebResourceRequest,
+                error: WebResourceError,
+            ) {
+                super.onReceivedError(view, request, error)
+                onContentReady()
+                // Subresources (ads, trackers) fail all the time -- only a failed main
+                // document warrants the error screen.
+                if (!request.isForMainFrame) return
+                view.loadDataWithBaseURL(
+                    null,
+                    errorPageHtml(isNightMode(view.context), error.description.toString(), url),
+                    "text/html",
+                    "utf-8",
+                    null,
+                )
+            }
+
+            // Fires when the WebView paints the first frame of actual page content -- the
+            // correct moment to hand off from the splash screen. onPageStarted (navigation
+            // start) fires ~0.5-0.9s earlier per the device logcat, which would drop the
+            // splash while the WebView was still blank; onPageCommitVisible dismisses it
+            // exactly as content appears. onReceivedError covers the failed-load path, and
+            // the 3s timeout in MainActivity is the final safety net.
+            override fun onPageCommitVisible(view: WebView, commitUrl: String?) {
+                super.onPageCommitVisible(view, commitUrl)
+                StartupTrace.log(isDebuggable, "onPageCommitVisible (first paint)")
+                onContentReady()
+            }
+
+            override fun onPageStarted(view: WebView, startUrl: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, startUrl, favicon)
+                if (isSearch && initialLoadDone && startUrl != null &&
+                    CITY_URL_REGEX.containsMatchIn(startUrl)
+                ) {
+                    onCitySelected(startUrl)
+                    return
+                }
+                view.evaluateJavascript(if (isSearch) INJECT_SEARCH_HIDE_STYLE_JS else INJECT_HIDE_STYLE_JS, null)
+                if (darkReaderInjectJs != null) {
+                    view.evaluateJavascript(darkReaderInjectJs, null)
+                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                }
+            }
+
+            override fun onPageFinished(view: WebView, finishedUrl: String?) {
+                super.onPageFinished(view, finishedUrl)
+                StartupTrace.log(isDebuggable, "onPageFinished (${if (isSearch) "search" else "weather"})")
+                if (isSearch) {
+                    // Only treat a landing as a user-picked city if it happens on a load
+                    // *after* the very first one finishes -- the initial SEARCH_URL load
+                    // (and any redirect chain leading up to its first finish, e.g. a
+                    // geolocation redirect) must never be mistaken for a selection.
+                    val isFirstLoad = !initialLoadDone
+                    initialLoadDone = true
+                    if (!isFirstLoad && finishedUrl != null && CITY_URL_REGEX.containsMatchIn(finishedUrl)) {
+                        onCitySelected(finishedUrl)
+                        return
+                    }
+                } else if (isDebuggable) {
+                    // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging is
+                    // active by the time it runs (and stays off in release builds).
+                    view.evaluateJavascript("window.__wetterDebug = true;", null)
+                }
+                view.evaluateJavascript(if (isSearch) INJECT_SEARCH_HIDE_STYLE_JS else INJECT_HIDE_STYLE_JS, null)
+                if (!isSearch) {
+                    view.evaluateJavascript(CLASSIFY_MODEL_BUTTONS_JS, null)
+                }
+                if (darkReaderInjectJs != null) {
+                    // Re-asserted after load, same as the hide style above, in case late
+                    // page scripts touched <head> after our first injection. The
+                    // "if (!window.DarkReader)" guard keeps this from re-parsing the
+                    // ~346KB bundle a second time within the same document.
+                    view.evaluateJavascript(darkReaderInjectJs, null)
+                    view.evaluateJavascript(ENABLE_DARKREADER_JS, null)
+                    if (!isSearch) {
+                        view.evaluateJavascript(AUTO_SITE_DARK_JS, null)
+                    }
+                }
+                view.evaluateJavascript(UNLOCK_SCROLL_JS, null)
+                if (isDebuggable && !isSearch) {
+                    view.evaluateJavascript(SCROLL_WATCH_JS, null)
+                    view.evaluateJavascript(RESOURCE_TIMING_DUMP_JS, null)
+                }
+                swipeRefreshLayout.isRefreshing = false
+            }
+        }
+    }
+    webViewRef = webView
+    swipeRefreshLayout.addView(webView)
+    return WebScreen(swipeRefreshLayout, webView)
+}
+
+// Deliberately not a Compose host. This screen is one WebView filling the window (or, on
+// first launch, the site's own search homepage): Compose contributed no UI, but measured
+// ~700ms of cold-start time between onCreate and the WebView's construction (setContent ->
+// composition -> AppTheme -> Scaffold -> AndroidView factory) -- see
+// docs/startup-performance.md. A plain setContentView builds the WebView and starts
+// loadUrl immediately.
+class MainActivity : ComponentActivity() {
+
+    private var webView: WebView? = null
+
+    // Tracked so onConfigurationChanged can tell a real day/night flip apart from any
+    // other config change -- uiMode's inclusion in android:configChanges routes every
+    // uiMode change here, and comparing the actual bit is more honest than assuming every
+    // callback is a theme flip.
+    private var isNight: Boolean = false
+
+    // Null means no city has been chosen yet -- first launch, or app data was cleared --
+    // so the search screen shows. Set once the user picks a city (see installCurrentScreen's
+    // onCitySelected) and persisted via saveCityUrl so future launches skip straight to the
+    // weather screen.
+    private var currentCityUrl: String? = null
+
+    // Polled by the splash screen (see setKeepOnScreenCondition below); flips once the
+    // WebView paints its first frame of actual page content (onPageCommitVisible), so the
+    // splash bridges the whole cold process + WebView-engine init + first-paint window
+    // instead of handing off to a still-blank WebView partway through.
+    @Volatile
+    private var contentReady = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // Must run before super.onCreate() so it can install itself before the window's
+        // first frame is drawn.
+        val splashScreen = installSplashScreen()
+        super.onCreate(savedInstanceState)
+        // Cold-start markers (debug builds only). The decorView.post lands after onCreate
+        // returns and the first traversal is scheduled, so it brackets onCreate's own cost.
+        val debug = (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        StartupTrace.log(debug, "MainActivity.onCreate")
+        window.decorView.post { StartupTrace.log(debug, "MainActivity.onCreate returned") }
+        splashScreen.setKeepOnScreenCondition { !contentReady }
+        // Safety net: if the WebView never reports back (unexpected load-path failure),
+        // don't hold the splash forever -- 3s covers cold WebView init with room to spare
+        // without meaningfully compounding a genuinely stuck load.
+        window.decorView.postDelayed({ contentReady = true }, 3000)
+        enableEdgeToEdge()
+        isNight = isNightMode(this)
+        currentCityUrl = readCityUrl(this)
+        installCurrentScreen()
+
+        // Replaces Compose's BackHandler. canGoBack() is queried live on each press, so
+        // in-page navigation is tracked without mirroring it into any state. Registered
+        // once here (not in installCurrentScreen): it reads the webView field live, so it
+        // keeps working across the rebuilds installCurrentScreen does (theme flips, and
+        // the search-to-weather transition).
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    val wv = webView
+                    if (wv != null && wv.canGoBack()) {
+                        wv.goBack()
+                    } else {
+                        // Nothing to go back to: step aside and let the default handler
+                        // (finish the activity) run.
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                    }
+                }
+            },
+        )
+    }
+
+    // Builds a fresh screen for the current city/search state and theme, and (re)loads its
+    // page. Called from onCreate, from onCitySelected once the user picks a city, and from
+    // onConfigurationChanged whenever the system day/night mode flips: theme is baked into
+    // the WebView at construction time (the Dark Reader read, setBackgroundColor), so a bare
+    // reload() on the existing instance would keep applying the OLD theme.
+    private fun installCurrentScreen() {
+        val cityUrl = currentCityUrl
+        val isSearch = cityUrl == null
+        val url = cityUrl ?: SEARCH_URL
+        val previous = webView
+        val screen = createWebScreen(
+            activity = this,
+            isSearch = isSearch,
+            url = url,
+            isNight = isNight,
+            onContentReady = { contentReady = true },
+            onCitySelected = { selectedUrl ->
+                saveCityUrl(this, selectedUrl)
+                currentCityUrl = selectedUrl
+                // Deferred: this callback fires from inside the search WebView's own
+                // WebViewClient callback, and destroying that WebView synchronously from
+                // within its own callback can crash. Posting runs it once the current
+                // callback has returned to the message loop.
+                window.decorView.post { installCurrentScreen() }
+            },
+        )
+        webView = screen.webView
+        setContentView(
+            screen.root,
+            ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+            ),
+        )
+        // What Scaffold's innerPadding used to do: keep the page out from under the status
+        // and navigation bars under enableEdgeToEdge().
+        ViewCompat.setOnApplyWindowInsetsListener(screen.root) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
+        screen.webView.loadUrl(url)
+        // Destroyed only after setContentView has already detached it from the window --
+        // WebView.destroy() expects to be called on a view no longer in the hierarchy.
+        previous?.destroy()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val night = (newConfig.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+            Configuration.UI_MODE_NIGHT_YES
+        if (night != isNight) {
+            isNight = night
+            // The activity no longer recreates on a theme flip (uiMode is in
+            // configChanges), so re-run enableEdgeToEdge to refresh the status/navigation-
+            // bar icon contrast for the new theme -- otherwise the light/dark bar icons
+            // stay stuck on the old scheme.
+            enableEdgeToEdge()
+            installCurrentScreen()
+        }
+    }
+
+    override fun onDestroy() {
+        webView?.destroy()
+        webView = null
+        super.onDestroy()
+    }
 }

@@ -59,7 +59,7 @@ Reordered after the 2026-07-23 capture. The "Plan" column maps to the plans belo
 
 | Lever | Plan | Effort | Value | Notes |
 |---|---|---|---|---|
-| Drop Compose; build the WebView in `onCreate` | **C** | High | **Highest for cold start** | Targets the ~700 ms `onCreate`→first-frame window (composition + WebView construction). Removing Compose lets `onCreate` `loadUrl` immediately instead of waiting on composition. lightningmaps saw −53% `am start` (debug upper bound; less on release) |
+| ✅ ~~Drop Compose; build the WebView in `onCreate`~~ | **C** | High | **Highest for cold start** | **Landed 2026-07-23**, not yet re-measured on device. Targets the ~700 ms `onCreate`→first-frame window (composition + WebView construction). lightningmaps saw −53% `am start` (debug upper bound; less on release) |
 | DNS + preconnect warm-up | A.1 | Low | Small–Med | Trims part of the ~950 ms page-load window; the city host is known at process start (stored URL) |
 | Baseline Profile (hand-written) | A.2 | Low–Med | Modest, ships to real users | Self-contained `:baselineprofile` module add |
 | `WebViewCompat.addDocumentStartJavaScript` | A.3 | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
@@ -172,19 +172,21 @@ Steps:
   (background stays dark via the seed). Acceptable given how much the app already leans on the
   native theme.
 
-### Plan C — Drop Compose (top cold-start lever, own plan)
-This is where the measured ~700 ms `onCreate`→first-frame window lives (composition + WebView
-construction). lightningmaps builds the WebView directly in `onCreate`; wetter wraps it in `Scaffold` +
-`AndroidView` plus the two-screen state machine. To remove Compose:
-- `onCreate` reads `cityUrl`: null → build the search WebView with a selection listener that saves
-  the URL and swaps `setContentView` to the weather WebView; non-null → build the weather WebView
-  directly.
-- **Companion refactor (do first, independently valuable):** unify the ~95%-duplicated
-  `CitySearchWebView` / `WeatherWebView` into one `buildWebView(url, isSearch)`. It de-risks the
-  Compose removal and shrinks the maintenance surface on its own.
-- Drops `activity-compose`, `compose-bom`, `material3`, `foundation`, `ui*` → sizeable APK +
-  startup win. Highest payoff, highest risk.
-- **Synergy**: doing Plan B first means the unified builder carries no Dark-Reader branch across.
+### ✅ Plan C — Drop Compose (top cold-start lever) — landed 2026-07-23
+This is where the measured ~700 ms `onCreate`→first-frame window lived (composition + WebView
+construction). `MainActivity` now builds the WebView directly in `onCreate` (`installCurrentScreen`),
+mirroring the lightningmaps sibling's `createWebView`/`installWebView` split — no `Scaffold`,
+`AndroidView`, or `setContent` left. The two ~95%-duplicated screen builders (`CitySearchWebView` /
+`WeatherWebView`) were unified into one `createWebScreen(activity, isSearch, url, isNight, ...)`.
+Plan E (`uiMode`) was folded in as planned: `onConfigurationChanged` now rebuilds just the WebView
+on a real night-bit change instead of the activity recreating. The whole `ui/theme/` package
+(`Theme.kt`/`Color.kt`/`Type.kt`) was deleted along with it — it only ever fed `MaterialTheme`,
+which rendered nothing behind the full-screen WebView. Dropped `activity-compose`, `compose-bom`,
+`material3`, `foundation`, `ui*`, `kotlin.plugin.compose` from both `build.gradle.kts` files.
+Version bumped 1.2.1 → 1.2.2 (patch: optimization, no user-facing feature). Both `assembleDebug`
+and `assembleRelease` (incl. R8 minify/shrink and lint-vital) build clean.
+**Not yet re-measured on device** — re-run `scripts/capture-startup.sh` and compare against the
+committed baseline above to confirm the `onCreate`→first-paint window actually shrank.
 
 ### ~~Plan D — BundleCache~~ (dropped, measured 2026-07-23)
 Investigated and dropped: Chromium already caches all of the site's version-stamped bundles from
