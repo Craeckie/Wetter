@@ -85,6 +85,15 @@ set_theme() {
         echo "WARNING: couldn't set night mode to '$arg' (cmd uimode unsupported?)" >&2
     fi
     sleep 2   # let the system settle after the reconfiguration
+    # Absorb one throwaway cold launch: `cmd uimode` can restart the app in the background,
+    # which otherwise surfaces as an anomalous first measured launch (observed: a +10s
+    # process-fork-to-onCreate gap in the very first launch after a flip).
+    adb shell am force-stop "$PACKAGE"
+    sleep 2
+    adb shell am start -n "$ACTIVITY" >/dev/null 2>&1 || true
+    sleep 3
+    adb shell am force-stop "$PACKAGE"
+    sleep 2
 }
 
 # median <file-of-numbers> -> integer median (or "n/a" if empty)

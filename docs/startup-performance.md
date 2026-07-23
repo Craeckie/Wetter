@@ -21,11 +21,14 @@ That single difference cleanly rules a chunk of lightningmaps' work out (everyth
 or map-tile-specific) and, conversely, means wetter's gate is dominated by page-load and by the
 app's own main-thread work before/around it.
 
-**Headline finding:** wetter is arguably in a *worse* pre-optimization position than lightningmaps
-was, because in night mode it does exactly what lightningmaps deleted — it **reads and parses the
-340 KB `darkreader.js` bundle on the main thread inside the `AndroidView` factory**
-(`app/src/main/java/com/example/wetter/MainActivity.kt:688` for the weather screen, `:885` for the
-search screen). That is the standout lever here.
+**Headline finding (measured 2026-07-23, see below):** the two addressable windows in a ~2 s cold
+start are **~700 ms of Compose composition + WebView construction** (`onCreate` → first frame) and
+**~950 ms of page load** (first frame → first paint). The 340 KB `darkreader.js` read that looked
+like the obvious lever is a **non-issue: 6–8 ms on the main thread**, because the read is cheap I/O
+and the expensive parse runs asynchronously in the WebView renderer, off the `am start` critical
+path. Dark mode measured no slower than light. So the top cold-start lever is **dropping Compose
+(Plan C)**, not removing Dark Reader (Plan B) — the opposite of this doc's first draft. Measurement
+earned its keep.
 
 ## Already present in wetter
 
@@ -50,17 +53,49 @@ launch"), or added independently:
 | CARTO tile retargeting, retina `{r}`, invert-tiles dark map | no self-managed map tile layer (wetter's radar is a page element) |
 | `RELAYOUT_JS` / Leaflet `invalidateSize` | no Leaflet map to re-measure |
 
-## Applicable levers, ranked for wetter
+## Applicable levers, ranked for wetter (measurement-informed)
 
-| ID | Lever | Effort | Value | Notes |
+Reordered after the 2026-07-23 capture. The "Plan" column maps to the plans below.
+
+| Lever | Plan | Effort | Value | Notes |
 |---|---|---|---|---|
-| **F** | Remove Dark Reader → rely on the site's own dark theme | Med (validation-heavy) | **Highest** | Deletes 340 KB from the APK **and** the main-thread read/parse; wetter already *prefers* the site's native theme |
-| **G** | Drop Compose; build the WebView in `onCreate` | High | High | lightningmaps measured −53% `am start` TotalTime (debug upper bound; less on release). wetter's two-screen state machine makes it more work than lightningmaps' single screen |
-| **D** | Baseline Profile (hand-written) | Low–Med | Modest, ships to real users | Self-contained `:baselineprofile` module add |
-| **A** | `WebViewCompat.addDocumentStartJavaScript` | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
-| **E** | DNS + preconnect warm-up | Low | Small | wetter knows the city host at process start (stored URL) |
-| **B** | `BundleCache` disk cache | Med | **Unknown — gated on investigation** | Only worth it if kachelmann serves version-stamped immutable bundles (see below) |
-| **C₂** | `uiMode` in `configChanges` + rebuild | Low–Med | Small | day/night flip is rare; today it triggers a full activity recreate |
+| Drop Compose; build the WebView in `onCreate` | **C** | High | **Highest for cold start** | Targets the ~700 ms `onCreate`→first-frame window (composition + WebView construction). Removing Compose lets `onCreate` `loadUrl` immediately instead of waiting on composition. lightningmaps saw −53% `am start` (debug upper bound; less on release) |
+| DNS + preconnect warm-up | A.1 | Low | Small–Med | Trims part of the ~950 ms page-load window; the city host is known at process start (stored URL) |
+| Baseline Profile (hand-written) | A.2 | Low–Med | Modest, ships to real users | Self-contained `:baselineprofile` module add |
+| `WebViewCompat.addDocumentStartJavaScript` | A.3 | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
+| `BundleCache` disk cache | D | Med | **Unknown — gated on investigation** | Only worth it if kachelmann serves version-stamped immutable bundles (see Open questions) |
+| Remove Dark Reader → rely on site's own dark theme | **B** | Med | **Not a cold-start lever (measured 6–8 ms).** APK −340 KB, memory, renderer CPU, and pure waste on launch #2+ | Demoted from the first draft's "highest"; still worth doing as cleanup |
+| `uiMode` in `configChanges` + rebuild | E | Low–Med | Small | day/night flip is rare; today it triggers a full activity recreate |
+
+## Measured baseline (2026-07-23, on device, debug build)
+
+`scripts/capture-startup.sh --compare-theme` + a no-arg run. Medians over steady-state cold
+launches (excluding the post-flip transition launch, which logged an anomalous +10 s
+`onCreate` — a `cmd uimode` background-restart artifact, not a user path). All deltas from
+process fork.
+
+| Milestone | Light (n=5) | Dark (n=5) |
+|---|---|---|
+| `MainActivity.onCreate` | 356 ms | 343 ms |
+| **`read darkreader.js`** | — | **6–7 ms** |
+| `onCreate returned` (1st frame) | 1065 ms | 1078 ms |
+| `onPageCommitVisible` (first paint) | 2038 ms | 1785 ms |
+| `Displayed` (am metric) | 2204 ms | 1925 ms |
+
+Where the ~2 s goes:
+
+```
+0 ──►~350ms    process fork → onCreate         cold process + Application (not app-addressable)
+~350 ──►~1065  onCreate → first frame          ~700ms  Compose composition + WebView construction
+~1065 ──►~2000 first frame → page first paint  ~950ms  page load (network + render)
+```
+
+Conclusions:
+- **Dark Reader is not a cold-start cost.** The read is 6–8 ms; dark launches were if anything
+  *faster* than light. Its parse is async in the renderer, off the `am start` path. Plan B is
+  reclassified as APK/memory/CPU cleanup.
+- **The ~700 ms `onCreate`→first-frame window is the top app-side lever** → Plan C (drop Compose).
+- **The ~950 ms page-load window** is network-bound → Plan A.1 (warm-up) + Plan D (if applicable).
 
 ## Current-state facts verified (2026-07-23)
 
@@ -77,18 +112,17 @@ launch"), or added independently:
   system day/night change fully recreates the activity.
 - No `androidx.webkit` dependency; no `:baselineprofile` module.
 
-## Open questions — pending an on-device capture
+## Open questions
 
-These block a firm decision on two items. See "What to capture" below.
-
-1. **Size of the Dark Reader main-thread cost (Plan F/B).** Expected to show as a day-vs-night
-   cold-launch delta. Not yet measured.
-2. **BundleCache feasibility (Plan D).** Needs the site's JS/CSS request URLs + cache headers.
+1. **Size of the Dark Reader main-thread cost.** ✅ **Answered 2026-07-23: 6–8 ms, negligible.**
+   See Measured baseline above.
+2. **BundleCache feasibility (Plan D).** Still open. Needs the site's JS/CSS request URLs + cache headers.
    The saved reference page (`scripts/reference-local/…`) has all assets inlined, so it can't
    answer this — only a live capture can. Build Plan D **only if** kachelmann serves
    version-stamped immutable bundles (like lightningmaps' `/min/?f=…&<stamp>`); if it's plain
    filenames on normal HTTP caching, Chromium already handles it and Plan D is dropped.
-3. **Startup baseline** to order F vs G. Not yet measured.
+3. **Startup baseline to order the plans.** ✅ **Answered 2026-07-23** (Measured baseline above):
+   Compose/WebView-init dominates the app-side window, so Plan C leads.
 
 ---
 
@@ -115,11 +149,13 @@ Make every change below measurable before optimizing.
    kachelmann document** — lightningmaps learned the hard way that this callback also fires on
    `about:blank` and same-origin iframes (its "triple arming" regression).
 
-### Plan B — Remove Dark Reader (the big win, own plan)
-The nuance that makes this *cleaner* for wetter than it was for lightningmaps: wetter **already
-prefers the site's own dark theme** — `AUTO_SITE_DARK_JS` clicks the site toggle (persisted via
-cookie), and the site renders Highcharts correctly, which Dark Reader cannot. Dark Reader is only
-a bridge until that activates, and on launch #2+ it's pure overhead (above).
+### Plan B — Remove Dark Reader (cleanup, not a startup lever)
+**Measurement (above) demoted this from the first draft's headline: the main-thread read is
+6–8 ms.** It's still worth doing — but for APK size (−340 KB), memory, renderer CPU during load,
+and eliminating pure-waste work on launch #2+ — not for cold-start time. The nuance that makes it
+*clean* for wetter: it **already prefers the site's own dark theme** — `AUTO_SITE_DARK_JS` clicks
+the site toggle (persisted via cookie), and the site renders Highcharts correctly, which Dark
+Reader cannot. Dark Reader is only a bridge until that activates, and on launch #2+ it's overhead.
 
 Steps:
 - **Validate on device**: confirm launch #2+ renders `body.dark` server-side from the first byte,
@@ -135,8 +171,9 @@ Steps:
   (background stays dark via the seed). Acceptable given how much the app already leans on the
   native theme.
 
-### Plan C — Drop Compose (biggest structural change, own plan)
-lightningmaps builds the WebView directly in `onCreate`; wetter wraps it in `Scaffold` +
+### Plan C — Drop Compose (top cold-start lever, own plan)
+This is where the measured ~700 ms `onCreate`→first-frame window lives (composition + WebView
+construction). lightningmaps builds the WebView directly in `onCreate`; wetter wraps it in `Scaffold` +
 `AndroidView` plus the two-screen state machine. To remove Compose:
 - `onCreate` reads `cityUrl`: null → build the search WebView with a selection listener that saves
   the URL and swaps `setContentView` to the weather WebView; non-null → build the weather WebView
@@ -160,10 +197,11 @@ activity teardown. Small, rare-path win; cheap once Compose is gone.
 
 ## Recommended sequencing
 
-**0 → A → B → C**, with D spun off only if the capture justifies it, and E folded into C. **Plan B
-is the single highest value-to-effort item** and is where to start after wiring up measurement.
-Semver: these are optimizations, so patch bumps (e.g. 1.2.1 → 1.2.2) unless a plan adds a
-user-visible feature.
+Revised after measurement: **0 → A → C → B**, with D spun off only if the capture justifies it,
+and E folded into C. **Plan C is the top cold-start lever** — start there once the low-risk Plan A
+batch is in. Plan A.1 (warm-up) is the cheapest trim of the page-load window. Plan B drops to
+cleanup and can land any time. Semver: these are optimizations, so patch bumps (e.g. 1.2.1 →
+1.2.2) unless a plan adds a user-visible feature.
 
 ## Instrumentation (debug builds only)
 
