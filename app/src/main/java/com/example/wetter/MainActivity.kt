@@ -37,6 +37,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import com.example.wetter.ui.theme.AppTheme
 import java.io.ByteArrayInputStream
+import kotlin.system.measureTimeMillis
 
 // First-launch entry point for the city search screen -- the site's own homepage, whose
 // header carries its native city search box (with autocomplete). Once the user picks a
@@ -584,6 +585,11 @@ class MainActivity : ComponentActivity() {
         // first frame is drawn.
         val splashScreen = installSplashScreen()
         super.onCreate(savedInstanceState)
+        // Cold-start markers (debug builds only). The decorView.post lands after onCreate
+        // returns and the first traversal is scheduled, so it brackets onCreate's own cost.
+        val debug = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0
+        StartupTrace.log(debug, "MainActivity.onCreate")
+        window.decorView.post { StartupTrace.log(debug, "MainActivity.onCreate returned") }
         splashScreen.setKeepOnScreenCondition { !contentReady }
         // Safety net: if the WebView never reports back (unexpected load-path failure),
         // don't hold the splash forever -- 3s covers cold WebView init with room to spare
@@ -685,7 +691,14 @@ fun WeatherWebView(url: String, modifier: Modifier = Modifier, onContentStarted:
                         val isDark = isNightMode(context)
                         // Loaded once per WebView instance rather than per navigation.
                         val darkReaderInjectJs = if (isDark) {
-                            val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                            // Timed because this read+decode of the 340 KB bundle happens on the
+                            // main thread during the AndroidView factory -- the night-mode-only
+                            // cost Plan B (docs/startup-performance.md) targets. Debug-only log.
+                            var bundle = ""
+                            val readMs = measureTimeMillis {
+                                bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                            }
+                            StartupTrace.log(isDebuggable, "read darkreader.js: ${bundle.length} chars in ${readMs}ms on main thread")
                             injectDarkReaderJs(bundle)
                         } else {
                             null
@@ -750,6 +763,7 @@ fun WeatherWebView(url: String, modifier: Modifier = Modifier, onContentStarted:
                             // timeout in MainActivity is the final safety net.
                             override fun onPageCommitVisible(view: WebView, url: String?) {
                                 super.onPageCommitVisible(view, url)
+                                StartupTrace.log(isDebuggable, "onPageCommitVisible (first paint)")
                                 onContentStarted()
                             }
 
@@ -764,6 +778,7 @@ fun WeatherWebView(url: String, modifier: Modifier = Modifier, onContentStarted:
 
                             override fun onPageFinished(view: WebView, url: String?) {
                                 super.onPageFinished(view, url)
+                                StartupTrace.log(isDebuggable, "onPageFinished (weather)")
                                 // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging
                                 // is active by the time it runs (and stays off in release builds).
                                 if (isDebuggable) {
@@ -882,7 +897,14 @@ fun CitySearchWebView(
                         }
                         val isDark = isNightMode(context)
                         val darkReaderInjectJs = if (isDark) {
-                            val bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                            // Timed because this read+decode of the 340 KB bundle happens on the
+                            // main thread during the AndroidView factory -- the night-mode-only
+                            // cost Plan B (docs/startup-performance.md) targets. Debug-only log.
+                            var bundle = ""
+                            val readMs = measureTimeMillis {
+                                bundle = context.assets.open("darkreader.js").bufferedReader().use { it.readText() }
+                            }
+                            StartupTrace.log(isDebuggable, "read darkreader.js: ${bundle.length} chars in ${readMs}ms on main thread")
                             injectDarkReaderJs(bundle)
                         } else {
                             null
@@ -942,6 +964,7 @@ fun CitySearchWebView(
                             // the right splash hand-off point, not navigation start.
                             override fun onPageCommitVisible(view: WebView, url: String?) {
                                 super.onPageCommitVisible(view, url)
+                                StartupTrace.log(isDebuggable, "onPageCommitVisible (first paint)")
                                 onContentStarted()
                             }
 
@@ -960,6 +983,7 @@ fun CitySearchWebView(
 
                             override fun onPageFinished(view: WebView, url: String?) {
                                 super.onPageFinished(view, url)
+                                StartupTrace.log(isDebuggable, "onPageFinished (search)")
                                 // Only treat a landing as a user-picked city if it happens
                                 // on a load *after* the very first one finishes -- the
                                 // initial SEARCH_URL load (and any redirect chain leading up
