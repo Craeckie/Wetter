@@ -62,7 +62,7 @@ Reordered after the 2026-07-23 capture. The "Plan" column maps to the plans belo
 |---|---|---|---|---|
 | ✅ ~~Drop Compose; build the WebView in `onCreate`~~ | **C** | High | **Highest for cold start** | **Landed 2026-07-23**, not yet re-measured on device. Targets the ~700 ms `onCreate`→first-frame window (composition + WebView construction). lightningmaps saw −53% `am start` (debug upper bound; less on release) |
 | ✅ ~~DNS warm-up~~ | A.1 | Low | Small–Med | **Landed 2026-07-24** (`aa4974c`): daemon `InetAddress.getAllByName` for the weather host in `WetterApplication.onCreate`. Shipped narrower than drafted — DNS resolve only, single host, no `<link preconnect>`/`dns-prefetch` injection (the 2026-07-23 finding showed only the main HTML doc hits the network on repeat launches) |
-| Baseline Profile (hand-written) | A.2 | Low–Med | Modest, ships to real users | Self-contained `:baselineprofile` module add |
+| ✅ ~~Baseline Profile (hand-written)~~ | A.2 | Low–Med | Modest, ships to real users | **Landed 2026-07-24**; `:baselineprofile` module + hand-written `app/src/main/baselineProfiles/baseline-prof.txt`. Release APK verified to embed `assets/dexopt/baseline.prof` with the app's real startup methods. Measurement pending (release-build A/B) |
 | `WebViewCompat.addDocumentStartJavaScript` | A.3 | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
 | ~~`BundleCache` disk cache~~ | ~~D~~ | — | **Dropped (measured).** Chromium already caches every bundle with no revalidation; see Open questions | — |
 | Remove Dark Reader → rely on site's own dark theme | **B** | Med | **Not a cold-start lever (measured 6–8 ms).** APK −340 KB, memory, renderer CPU, and pure waste on launch #2+ | Demoted from the first draft's "highest"; still worth doing as cleanup |
@@ -146,10 +146,18 @@ Make every change below measurable before optimizing.
    finding showed only the main HTML document hits the network on repeat launches (every JS/CSS
    subresource served from Chromium's disk cache), so link hints and a separate CDN host weren't
    warranted.
-2. **Baseline Profile** — add a `:baselineprofile` module + `androidx.profileinstaller` + a
-   hand-written `baseline-prof.txt` (wildcards for `com.example.wetter.**`, WebView, Compose).
-   Straight port from lightningmaps (which had to hand-write it because its dev device can't
-   capture one; the rules are device-independent class/method names).
+2. ✅ **Baseline Profile** — **landed 2026-07-24.** `:baselineprofile` generator module (kept for
+   the day a capture-capable device appears) + hand-written
+   `app/src/main/baselineProfiles/baseline-prof.txt` with `Lcom/example/wetter/**` wildcards —
+   **no Compose rules** (Plan C removed Compose; WebKit/profileinstaller merge their own from
+   their AARs). Verified the release APK embeds `assets/dexopt/baseline.prof` carrying the app's
+   real startup methods (`MainActivity.onCreate`, `WetterApplication.onCreate`, …), correctly
+   mapped through R8. **Measurement caveat:** a baseline profile only helps *release* (non-
+   debuggable) builds — the platform never AOT-compiles a debuggable app from it — so its effect
+   is invisible to the debug `StartupTrace`/`capture-startup.sh` flow. Measure it as an A/B of
+   release-with-profile vs release-without via `am start -W` TotalTime. Since `profileinstaller`
+   is present either way (transitive), the isolated delta is just the app's own startup methods
+   being AOT-compiled instead of JIT'd — expected small on this WebView-dominated start.
 3. **`addDocumentStartJavaScript`** for `INJECT_HIDE_STYLE_JS` (+ a pre-dark seed) — add
    `androidx.webkit`, feature-gate via `WebViewFeature.isFeatureSupported(DOCUMENT_START_SCRIPT)`,
    keep `onPageStarted`/`onPageFinished` as fallback. **Guard it to run only on the real

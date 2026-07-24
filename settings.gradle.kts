@@ -23,3 +23,4 @@ dependencyResolutionManagement {
 rootProject.name = "Wetter"
 
 include(":app")
+include(":baselineprofile")

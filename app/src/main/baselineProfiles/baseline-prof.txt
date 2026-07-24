@@ -1,0 +1,33 @@
+# Hand-written baseline profile.
+#
+# Why not a captured one: this app's target device (Android 13, hardened ROM) does not
+# produce an ART profile for `cmd package dump-profiles` to read, so macrobenchmark's
+# BaselineProfileRule fails at its extraction step. See docs/startup-performance.md (Plan
+# A.2). The :baselineprofile module is kept for the day a capture-capable device turns up.
+#
+# What this buys: the app's own classes and methods are AOT-compiled at install time
+# instead of being JIT'd during the first cold start. That is the whole of this app's code
+# (MainActivity + the WebView screen builder, WetterApplication, StartupTrace) -- small,
+# but all of it is on the startup path, so all of it is worth compiling. WebKit and
+# profileinstaller each ship their own baseline profiles inside their AARs and are merged
+# in separately, so they are not repeated here. (Compose was removed in Plan C, so unlike
+# the lightningmaps sibling there are no Compose-runtime rules to add.)
+#
+# What it does NOT buy, versus a captured profile: no dex-layout ordering and no real
+# hot/startup/post-startup distinction -- every method is flagged the same rather than
+# according to what actually ran. That makes this coarser than a real capture, not
+# equivalent to one. Replace it with a captured profile if a suitable device turns up.
+#
+# NOTE: a baseline profile only benefits non-debuggable (release) builds -- the platform
+# never AOT-compiles a debuggable app from it. Measure its effect on a release build via
+# `am start -W` TotalTime, not the debug-only StartupTrace markers.
+#
+# Wildcards are expanded by AGP at build time (the expandReleaseArtProfileWildcards task).
+# Format: [flags]Lclass/name;->method(params)returnType
+#   H = hot, S = startup, P = post-startup
+
+# Every class in the app package: load them without a class-lookup miss.
+Lcom/example/wetter/**;
+
+# Every method in the app package, flagged hot + startup.
+HSPLcom/example/wetter/**->**(**)**
