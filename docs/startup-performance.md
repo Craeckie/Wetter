@@ -4,7 +4,8 @@ This app and [`../lightningmaps`](../../lightningmaps) are both single-`WebView`
 on the workspace's `android-basic` template, so most of lightningmaps' startup work transfers
 structurally. This doc records which of its levers already landed here, which don't apply, which
 are worth doing (with effort/value), and the plans to do them. It is an **analysis + backlog**,
-not a changelog — nothing below is implemented yet.
+not a changelog. Items that have since landed are flagged ✅ inline (Plans C and A.1 so far);
+everything else is still backlog.
 
 lightningmaps' own writeup is [`../lightningmaps/docs/startup-performance.md`](../../lightningmaps/docs/startup-performance.md);
 its measured results are the reference numbers quoted here.
@@ -60,7 +61,7 @@ Reordered after the 2026-07-23 capture. The "Plan" column maps to the plans belo
 | Lever | Plan | Effort | Value | Notes |
 |---|---|---|---|---|
 | ✅ ~~Drop Compose; build the WebView in `onCreate`~~ | **C** | High | **Highest for cold start** | **Landed 2026-07-23**, not yet re-measured on device. Targets the ~700 ms `onCreate`→first-frame window (composition + WebView construction). lightningmaps saw −53% `am start` (debug upper bound; less on release) |
-| DNS + preconnect warm-up | A.1 | Low | Small–Med | Trims part of the ~950 ms page-load window; the city host is known at process start (stored URL) |
+| ✅ ~~DNS warm-up~~ | A.1 | Low | Small–Med | **Landed 2026-07-24** (`aa4974c`): daemon `InetAddress.getAllByName` for the weather host in `WetterApplication.onCreate`. Shipped narrower than drafted — DNS resolve only, single host, no `<link preconnect>`/`dns-prefetch` injection (the 2026-07-23 finding showed only the main HTML doc hits the network on repeat launches) |
 | Baseline Profile (hand-written) | A.2 | Low–Med | Modest, ships to real users | Self-contained `:baselineprofile` module add |
 | `WebViewCompat.addDocumentStartJavaScript` | A.3 | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
 | ~~`BundleCache` disk cache~~ | ~~D~~ | — | **Dropped (measured).** Chromium already caches every bundle with no revalidation; see Open questions | — |
@@ -107,7 +108,8 @@ Conclusions:
   once the site's own `body.dark` appears (`AUTO_SITE_DARK_JS` clicks the site's dark toggle,
   persisted server-side). On launch #2+ the cookie makes the server render dark from the first
   byte, so Dark Reader **enables then immediately disables itself — pure overhead**.
-- **`WetterApplication.onCreate`** is empty (no DNS warm-up).
+- **`WetterApplication.onCreate`** was empty at capture time; Plan A.1 has **since landed**
+  (`aa4974c`, 2026-07-24), so it now resolves the weather host's DNS on a `MIN_PRIORITY` daemon thread.
 - **Manifest** `configChanges` = `orientation|screenSize|keyboardHidden` — **no `uiMode`**, so a
   system day/night change fully recreates the activity.
 - No `androidx.webkit` dependency; no `:baselineprofile` module.
@@ -137,9 +139,13 @@ Make every change below measurable before optimizing.
   summarized automatically. Until then, `grep '\[startup' <log>` gives the timeline by hand.
 
 ### Plan A — Low-risk batch (each independently shippable)
-1. **DNS/preconnect warm-up** — fill in `WetterApplication.onCreate` with a daemon-thread
-   `InetAddress.getAllByName` for `kachelmannwetter.com` + the image CDN host(s); inject
-   `<link rel=preconnect/dns-prefetch>` hints.
+1. ✅ **DNS warm-up** — **landed 2026-07-24 (`aa4974c`).** `WetterApplication.onCreate` resolves
+   `kachelmannwetter.com` on a `MIN_PRIORITY` daemon thread via `InetAddress.getAllByName`
+   (`WARM_HOSTS`, kept as an extensible list). Shipped narrower than first drafted: **no**
+   `<link rel=preconnect/dns-prefetch>` injection and a single host — the 2026-07-23 `__wetter_res__`
+   finding showed only the main HTML document hits the network on repeat launches (every JS/CSS
+   subresource served from Chromium's disk cache), so link hints and a separate CDN host weren't
+   warranted.
 2. **Baseline Profile** — add a `:baselineprofile` module + `androidx.profileinstaller` + a
    hand-written `baseline-prof.txt` (wildcards for `com.example.wetter.**`, WebView, Compose).
    Straight port from lightningmaps (which had to hand-write it because its dev device can't
@@ -217,8 +223,9 @@ activity teardown. Small, rare-path win; cheap once Compose is gone.
 ## Recommended sequencing
 
 Revised after measurement: **0 → A → C → B**, with **D dropped** and E folded into C. **Plan C is
-the top cold-start lever** — start there once the low-risk Plan A batch is in. Plan A.1 (warm-up)
-is the cheapest trim of the page-load window. Plan B drops to cleanup and can land any time.
+the top cold-start lever** — start there once the low-risk Plan A batch is in. Plan A.1 (warm-up,
+**landed**) was the cheapest trim of the page-load window; A.2/A.3 remain. Plan B drops to cleanup
+and can land any time.
 Semver: these are optimizations, so patch bumps (e.g. 1.2.1 → 1.2.2) unless a plan adds a
 user-visible feature.
 
