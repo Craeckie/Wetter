@@ -134,7 +134,11 @@ Conclusions:
 ### Plan 0 — Measurement first
 Make every change below measurable before optimizing.
 - **Done:** `scripts/capture-startup.sh` (cold-launch capture + `--compare-theme` delta), and
-  debug-only `StartupTrace` markers in the app (see "Instrumentation" below).
+  debug-only `StartupTrace` markers in the app (see "Instrumentation" below). The script now
+  bundles each run into a single `startup-results-<ts>.zip` (timings, logcat, before/after
+  screenshots, `timeline.txt`, `analysis.txt`, and a `meta.txt` that records device/build info
+  **and auto-flags whether the run measured the WEATHER page or only the SEARCH homepage** —
+  the trap that bit the A.2 A/B when the key-switch uninstall wiped the saved city).
 - **TODO:** port lightningmaps' `analyze_log.py --startup` timeline mode so the raw logcat is
   summarized automatically. Until then, `grep '\[startup' <log>` gives the timeline by hand.
 
