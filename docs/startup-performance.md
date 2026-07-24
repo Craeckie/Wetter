@@ -260,6 +260,22 @@ user-visible feature.
   and it fights the site's own script ordering) — needs experimentation before it's a plan.
   This is likely the biggest remaining page-load lever after Compose removal.
 
+  **Tried 2026-07-24 — naive stub + re-inject: breaks the charts, abandoned.** Experiment
+  (debug A/B, not committed): stub `graph.js`'s initial request in `shouldInterceptRequest`,
+  capture its URL, and re-inject the real `<script>` right after `onPageCommitVisible`. Result:
+  the charts stick on their "…wird geladen" placeholders on the **common** path — a direct reopen
+  to the cached weather page. Cause: the site initializes its charts **without waiting for or
+  retrying `Highcharts`**, so stubbing the bundle turns chart survival into a race between the
+  re-injected `graph.js` and the site's own chart-init. On a **cold** load (fresh city via
+  search) the re-injection wins and charts appear; on a **warm/cached** load (every daily reopen
+  — the primary use case) the site's init fires first, finds `Highcharts` undefined, and gives
+  up. Disqualifying. A shippable version would need a **Highcharts-queuing shim** injected at
+  document-start (a placeholder `window.Highcharts` that records `chart()`/`stockChart()`/… calls
+  and replays them once the real bundle loads) — high effort, fragile, and Highcharts-version-
+  specific. Only worth revisiting if a first-paint measurement shows a large enough win to justify
+  that shim; the charts render below the fold and the placeholder boxes paint above it regardless,
+  so the first-paint upside is expected to be small.
+
 ## Instrumentation (debug builds only)
 
 `StartupTrace` (`app/src/main/java/com/example/wetter/StartupTrace.kt`) logs cold-start markers
