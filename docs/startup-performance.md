@@ -62,7 +62,7 @@ Reordered after the 2026-07-23 capture. The "Plan" column maps to the plans belo
 |---|---|---|---|---|
 | ✅ ~~Drop Compose; build the WebView in `onCreate`~~ | **C** | High | **Highest for cold start** | **Landed 2026-07-23**, not yet re-measured on device. Targets the ~700 ms `onCreate`→first-frame window (composition + WebView construction). lightningmaps saw −53% `am start` (debug upper bound; less on release) |
 | ✅ ~~DNS warm-up~~ | A.1 | Low | Small–Med | **Landed 2026-07-24** (`aa4974c`): daemon `InetAddress.getAllByName` for the weather host in `WetterApplication.onCreate`. Shipped narrower than drafted — DNS resolve only, single host, no `<link preconnect>`/`dns-prefetch` injection (the 2026-07-23 finding showed only the main HTML doc hits the network on repeat launches) |
-| ✅ ~~Baseline Profile (hand-written)~~ | A.2 | Low–Med | Modest, ships to real users | **Landed 2026-07-24**; `:baselineprofile` module + hand-written `app/src/main/baselineProfiles/baseline-prof.txt`. Release APK verified to embed `assets/dexopt/baseline.prof` with the app's real startup methods. Measurement pending (release-build A/B) |
+| ✅ ~~Baseline Profile (hand-written)~~ | A.2 | Low–Med | Modest, ships to real users | **Landed 2026-07-24**; `:baselineprofile` module + hand-written `app/src/main/baselineProfiles/baseline-prof.txt`. Release APK verified to embed `assets/dexopt/baseline.prof` with the app's real startup methods. **Measured 2026-07-24: no delta** — the dev device's hardened ROM forces `status=verify` (no AOT), so the profile can't take effect here; still ships value to normal devices |
 | `WebViewCompat.addDocumentStartJavaScript` | A.3 | Low–Med | Modest | Earlier hide/dark-seed injection = less flash; consolidates the `onPageStarted`+`onPageFinished` double-inject. Needs `androidx.webkit` |
 | ~~`BundleCache` disk cache~~ | ~~D~~ | — | **Dropped (measured).** Chromium already caches every bundle with no revalidation; see Open questions | — |
 | Remove Dark Reader → rely on site's own dark theme | **B** | Med | **Not a cold-start lever (measured 6–8 ms).** APK −340 KB, memory, renderer CPU, and pure waste on launch #2+ | Demoted from the first draft's "highest"; still worth doing as cleanup |
@@ -158,6 +158,17 @@ Make every change below measurable before optimizing.
    release-with-profile vs release-without via `am start -W` TotalTime. Since `profileinstaller`
    is present either way (transitive), the isolated delta is just the app's own startup methods
    being AOT-compiled instead of JIT'd — expected small on this WebView-dominated start.
+
+   **Measured 2026-07-24** — A/B of release-with vs release-without, 8 cold launches each,
+   `Displayed` medians (launch 1 dropped): **1267 ms vs 1246 ms** — a 21 ms (~1.6%) difference
+   well inside run-to-run noise. Root cause: `dumpsys package dexopt` kept reporting
+   `status=verify [reason=cmdline]` even after a forced `compile -m speed-profile`, i.e. the dev
+   device's hardened ROM refuses to AOT-compile the app at all — the same limitation that blocks
+   macrobenchmark profile capture. So **A.2 is unmeasurable on this device** (both APKs run
+   interpreted); it still ships AOT value to normal-device / F-Droid installs. Silver lining:
+   these are our first **release**-build numbers — **~1.25 s `Displayed`** steady-state, ~340 ms
+   (~21%) below the 1.59 s **debug** figure in the Measured baseline above. Every prior number in
+   this doc is a debug build; real installs are meaningfully faster.
 3. **`addDocumentStartJavaScript`** for `INJECT_HIDE_STYLE_JS` (+ a pre-dark seed) — add
    `androidx.webkit`, feature-gate via `WebViewFeature.isFeatureSupported(DOCUMENT_START_SCRIPT)`,
    keep `onPageStarted`/`onPageFinished` as fallback. **Guard it to run only on the real
