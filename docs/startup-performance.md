@@ -164,11 +164,21 @@ Make every change below measurable before optimizing.
    well inside run-to-run noise. Root cause: `dumpsys package dexopt` kept reporting
    `status=verify [reason=cmdline]` even after a forced `compile -m speed-profile`, i.e. the dev
    device's hardened ROM refuses to AOT-compile the app at all — the same limitation that blocks
-   macrobenchmark profile capture. So **A.2 is unmeasurable on this device** (both APKs run
-   interpreted); it still ships AOT value to normal-device / F-Droid installs. Silver lining:
-   these are our first **release**-build numbers — **~1.25 s `Displayed`** steady-state, ~340 ms
-   (~21%) below the 1.59 s **debug** figure in the Measured baseline above. Every prior number in
-   this doc is a debug build; real installs are meaningfully faster.
+   macrobenchmark profile capture (the dev device is **GrapheneOS**). So **A.2 is unmeasurable on
+   this device** (both APKs run interpreted); it still ships AOT value to normal-device / F-Droid
+   installs.
+
+   **Correction (caught afterward): these runs measured the wrong page.** The `adb uninstall`
+   required to switch to the measure-signing key wiped the saved city, so with `currentCityUrl ==
+   null` every cold start loaded the light **search homepage** (`SEARCH_URL`), **not** the heavy
+   weather page. Confirmed from the logs — only `kachelmannwetter.com/de/`, never a
+   `/de/wetter/<id>-<city>` page. So the 1267/1246 ms numbers are the *search* page and are **not**
+   comparable to this doc's debug weather-page baselines; an earlier draft's "release ~1.25 s vs
+   debug ~1.59 s, ~21% faster" claim was that apples-to-oranges mistake and is retracted. We still
+   have **no valid release weather-page number**, and because the ROM forces `verify` one measured
+   here wouldn't represent a real AOT install anyway. The A.2 "no delta" conclusion is unaffected —
+   `verify` defeats the profile on either page. Lesson: after any key-switch uninstall, re-pick a
+   city before measuring, and confirm a `/de/wetter/…` URL in the log.
 3. **`addDocumentStartJavaScript`** for `INJECT_HIDE_STYLE_JS` (+ a pre-dark seed) — add
    `androidx.webkit`, feature-gate via `WebViewFeature.isFeatureSupported(DOCUMENT_START_SCRIPT)`,
    keep `onPageStarted`/`onPageFinished` as fallback. **Guard it to run only on the real
