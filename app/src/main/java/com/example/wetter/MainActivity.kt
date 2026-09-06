@@ -36,9 +36,15 @@ import kotlin.system.measureTimeMillis
 private const val SEARCH_URL = "https://kachelmannwetter.com/de/"
 
 // Matches a per-city weather page, e.g. ".../de/wetter/2892794-city" -- used to detect
-// that the user's city search has landed on a real city page (as opposed to the homepage
-// itself, an intermediate redirect, or an unrelated site link).
+// that a city search has landed on a real city page (as opposed to the homepage itself,
+// an intermediate redirect, or an unrelated site link).
 private val CITY_URL_REGEX = Regex("""^https://(www\.)?kachelmannwetter\.com/de/wetter/\d+-[^/?#]+""")
+
+// The city page's root URL for a URL on that page, or null if it isn't a city page at
+// all. Sub-pages of a city (the 14-day trend, a specific model view, ...) and any query
+// string are trimmed off, so what gets remembered is always the city's main forecast page
+// rather than whichever of its sub-views the user happened to be on when they navigated.
+private fun cityRootOf(url: String): String? = CITY_URL_REGEX.find(url)?.value
 
 private const val PREFS_NAME = "wetter_prefs"
 private const val KEY_CITY_URL = "city_url"
@@ -624,8 +630,12 @@ private class WebScreen(val root: SwipeRefreshLayout, val webView: WebView)
 // homepage (search box + autocomplete, isSearch=true) or a per-city weather page
 // (isSearch=false). The two screens share every WebView workaround (ad blocking, hide
 // CSS, Dark Reader, scroll-unlock, error page, console forwarding); isSearch only
-// switches the hide-CSS variant and arms the CITY_URL_REGEX city-detection watch that
-// calls onCitySelected once the user's search lands on a real city page.
+// switches the hide-CSS variant and decides what happens after a city is detected.
+//
+// Both screens watch for navigations landing on a city page (CITY_URL_REGEX) and report
+// them via onCityUrl -- on the search screen that's the user picking their first city, on
+// the weather screen it's them searching a different place from the page's own
+// Wetterübersicht menu. Either way the app should remember it.
 //
 // Does NOT call loadUrl itself -- the caller does that after wiring up window-inset
 // handling, matching the lightningmaps sibling's createWebView/installWebView split.
@@ -636,7 +646,7 @@ private fun createWebScreen(
     url: String,
     isNight: Boolean,
     onContentReady: () -> Unit,
-    onCitySelected: (String) -> Unit,
+    onCityUrl: (String) -> Unit,
 ): WebScreen {
     val context: Context = activity
     var webViewRef: WebView? = null
@@ -700,10 +710,9 @@ private fun createWebScreen(
             // painted and Dark Reader (or the site's own dark theme) has kicked in.
             setBackgroundColor(Color.parseColor("#000000"))
         }
-        // Set once the first onPageFinished has run, so the initial programmatic load of
-        // SEARCH_URL (and any server-side redirect chain it goes through before settling)
-        // is never mistaken for a user-picked city. Only meaningful when isSearch; unused
-        // (stays false) on the weather screen.
+        // Set once the first onPageFinished has run, so this screen's own initial
+        // programmatic load (and any server-side redirect chain it goes through before
+        // settling) is never mistaken for a user-picked city.
         var initialLoadDone = false
         webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(
@@ -765,11 +774,16 @@ private fun createWebScreen(
 
             override fun onPageStarted(view: WebView, startUrl: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, startUrl, favicon)
-                if (isSearch && initialLoadDone && startUrl != null &&
-                    CITY_URL_REGEX.containsMatchIn(startUrl)
-                ) {
-                    onCitySelected(startUrl)
-                    return
+                if (initialLoadDone && startUrl != null) {
+                    val city = cityRootOf(startUrl)
+                    if (city != null) {
+                        onCityUrl(city)
+                        // On the search screen the whole screen is about to be rebuilt as
+                        // the weather screen, so the injections below would be wasted; on
+                        // the weather screen the navigation stays in this WebView and they
+                        // still have to run.
+                        if (isSearch) return
+                    }
                 }
                 view.evaluateJavascript(if (isSearch) INJECT_SEARCH_HIDE_STYLE_JS else INJECT_HIDE_STYLE_JS, null)
                 if (darkReaderInjectJs != null) {
@@ -781,18 +795,21 @@ private fun createWebScreen(
             override fun onPageFinished(view: WebView, finishedUrl: String?) {
                 super.onPageFinished(view, finishedUrl)
                 StartupTrace.log(isDebuggable, "onPageFinished (${if (isSearch) "search" else "weather"})")
-                if (isSearch) {
-                    // Only treat a landing as a user-picked city if it happens on a load
-                    // *after* the very first one finishes -- the initial SEARCH_URL load
-                    // (and any redirect chain leading up to its first finish, e.g. a
-                    // geolocation redirect) must never be mistaken for a selection.
-                    val isFirstLoad = !initialLoadDone
-                    initialLoadDone = true
-                    if (!isFirstLoad && finishedUrl != null && CITY_URL_REGEX.containsMatchIn(finishedUrl)) {
-                        onCitySelected(finishedUrl)
-                        return
+                // Only treat a landing as a user-picked city if it happens on a load
+                // *after* the very first one finishes -- neither the initial SEARCH_URL
+                // load (and any redirect chain leading up to its first finish, e.g. a
+                // geolocation redirect) nor the initial load of the remembered city page
+                // must be mistaken for a selection.
+                val isFirstLoad = !initialLoadDone
+                initialLoadDone = true
+                if (!isFirstLoad && finishedUrl != null) {
+                    val city = cityRootOf(finishedUrl)
+                    if (city != null) {
+                        onCityUrl(city)
+                        if (isSearch) return
                     }
-                } else if (isDebuggable) {
+                }
+                if (!isSearch && isDebuggable) {
                     // Set the debug flag first so UNLOCK_SCROLL_JS's breadcrumb logging is
                     // active by the time it runs (and stays off in release builds).
                     view.evaluateJavascript("window.__wetterDebug = true;", null)
@@ -843,9 +860,10 @@ class MainActivity : ComponentActivity() {
     private var isNight: Boolean = false
 
     // Null means no city has been chosen yet -- first launch, or app data was cleared --
-    // so the search screen shows. Set once the user picks a city (see installCurrentScreen's
-    // onCitySelected) and persisted via saveCityUrl so future launches skip straight to the
-    // weather screen.
+    // so the search screen shows. Set (and persisted via saveCityUrl, so future launches
+    // skip straight to the weather screen) every time the user lands on a city page: their
+    // first pick from the search screen, and every later switch to a different place via
+    // the weather page's own menu. See installCurrentScreen's onCityUrl.
     private var currentCityUrl: String? = null
 
     // Polled by the splash screen (see setKeepOnScreenCondition below); flips once the
@@ -899,7 +917,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // Builds a fresh screen for the current city/search state and theme, and (re)loads its
-    // page. Called from onCreate, from onCitySelected once the user picks a city, and from
+    // page. Called from onCreate, from onCityUrl once the user picks their first city, and from
     // onConfigurationChanged whenever the system day/night mode flips: theme is baked into
     // the WebView at construction time (the Dark Reader read, setBackgroundColor), so a bare
     // reload() on the existing instance would keep applying the OLD theme.
@@ -914,14 +932,24 @@ class MainActivity : ComponentActivity() {
             url = url,
             isNight = isNight,
             onContentReady = { contentReady = true },
-            onCitySelected = { selectedUrl ->
-                saveCityUrl(this, selectedUrl)
-                currentCityUrl = selectedUrl
-                // Deferred: this callback fires from inside the search WebView's own
-                // WebViewClient callback, and destroying that WebView synchronously from
-                // within its own callback can crash. Posting runs it once the current
-                // callback has returned to the message loop.
-                window.decorView.post { installCurrentScreen() }
+            onCityUrl = { selectedUrl ->
+                if (selectedUrl != currentCityUrl) {
+                    val cameFromSearch = currentCityUrl == null
+                    saveCityUrl(this, selectedUrl)
+                    currentCityUrl = selectedUrl
+                    // Only the first pick needs a new screen (the search screen has to
+                    // become the weather screen). A later switch happened inside the
+                    // weather WebView, which is already showing the new place -- rebuilding
+                    // would just throw away the load it has done and start it over.
+                    if (cameFromSearch) {
+                        // Deferred: this callback fires from inside the search WebView's
+                        // own WebViewClient callback, and destroying that WebView
+                        // synchronously from within its own callback can crash. Posting
+                        // runs it once the current callback has returned to the message
+                        // loop.
+                        window.decorView.post { installCurrentScreen() }
+                    }
+                }
             },
         )
         webView = screen.webView
