@@ -12,6 +12,7 @@ splashscreen = "1.2.0"
 benchmarkMacroJunit4 = "1.4.1"
 uiautomator = "2.3.0"
 profileinstaller = "1.4.1"
+webkit = "1.15.0"
 baselineprofile = "1.4.1"
 
 [libraries]
@@ -26,6 +27,7 @@ androidx-core-splashscreen = { group = "androidx.core", name = "core-splashscree
 androidx-benchmark-macro-junit4 = { group = "androidx.benchmark", name = "benchmark-macro-junit4", version.ref = "benchmarkMacroJunit4" }
 androidx-uiautomator = { group = "androidx.test.uiautomator", name = "uiautomator", version.ref = "uiautomator" }
 androidx-profileinstaller = { group = "androidx.profileinstaller", name = "profileinstaller", version.ref = "profileinstaller" }
+androidx-webkit = { group = "androidx.webkit", name = "webkit", version.ref = "webkit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

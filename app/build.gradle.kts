@@ -41,6 +41,7 @@ dependencies {
     implementation(libs.androidx.swiperefreshlayout)
     implementation(libs.androidx.core.splashscreen)
     implementation(libs.androidx.profileinstaller)
+    implementation(libs.androidx.webkit)
 
     baselineProfile(project(":baselineprofile"))
 

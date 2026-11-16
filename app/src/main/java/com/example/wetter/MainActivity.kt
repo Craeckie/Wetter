@@ -1,6 +1,7 @@
 package com.example.wetter
 
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
@@ -8,7 +9,11 @@ import android.content.pm.ApplicationInfo
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Typeface
 import android.os.Bundle
+import android.os.SystemClock
+import android.text.InputType
+import android.view.Gravity
 import android.util.Log
 import android.view.HapticFeedbackConstants
 import android.view.ViewGroup
@@ -19,6 +24,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.enableEdgeToEdge
@@ -465,8 +473,65 @@ private fun errorPageHtml(isDark: Boolean, reason: String, retryUrl: String): St
         </head><body>
         <a href="$retryUrl">kachelmannwetter.com is unreachable<br>
         <small>$reason &middot; retrying automatically, tap to retry now</small></a>
+        <a href="$PROXY_SETTINGS_URL" style="position: fixed; bottom: 1em"><small>proxy settings</small></a>
         </body></html>
     """.trimIndent()
+}
+
+// Link target the in-app pages use to open the proxy settings dialog (intercepted in
+// shouldOverrideUrlLoading, never loaded).
+private const val PROXY_SETTINGS_URL = "wetter-app://proxies"
+
+// The site answers a main-frame request with 403 "Access Denied" when its CDN (Akamai)
+// refuses the client's network -- in practice VPN/datacenter IP ranges, which it blocks a
+// whole provider ASN at a time. There is no other 403 path on these pages.
+private fun isSiteBlock(request: WebResourceRequest, response: WebResourceResponse): Boolean {
+    val host = request.url.host ?: return false
+    return request.isForMainFrame && response.statusCode == 403 &&
+        (host == "kachelmannwetter.com" || host.endsWith(".kachelmannwetter.com"))
+}
+
+// Shown when the site blocks the network and no configured proxy got through either. No
+// auto-refresh: retrying the same blocked IP every few seconds would only repeat the block.
+private fun blockedPageHtml(isDark: Boolean, retryUrl: String, proxyCount: Int, proxySupported: Boolean): String {
+    val bg = if (isDark) "#000000" else "#fafafa"
+    val fg = if (isDark) "#9e9e9e" else "#555555"
+    val proxyLine = when {
+        !proxySupported -> "This WebView can't use a proxy; update Android System WebView to enable that."
+        proxyCount == 0 -> "Or add a proxy on a network the site accepts; the app switches to it on a block."
+        else -> "All $proxyCount configured ${if (proxyCount == 1) "proxy was" else "proxies were"} blocked or unreachable too."
+    }
+    return """
+        <!doctype html><html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body { background: $bg; color: $fg; font-family: sans-serif; margin: 0; padding: 2em;
+                   box-sizing: border-box; min-height: 100vh; display: flex; flex-direction: column;
+                   justify-content: center; text-align: center; line-height: 1.5; }
+            a { color: inherit; display: block; padding: .8em; }
+            small { opacity: .7 }
+        </style>
+        </head><body>
+        <p>kachelmannwetter.com refuses this network (Access Denied).</p>
+        <p><small>This usually means a VPN or datacenter IP. Switch the VPN server, or exclude
+        this app from the VPN. $proxyLine</small></p>
+        <a href="$retryUrl">Retry</a>
+        ${if (proxySupported) "<a href=\"$PROXY_SETTINGS_URL\">Proxy settings</a>" else ""}
+        </body></html>
+    """.trimIndent()
+}
+
+// What a WebScreen reports to the activity about blocks and failed loads; the activity owns
+// the proxy rotation, which outlives any single WebView (screens are rebuilt on theme flips).
+interface ProxyHooks {
+    // The site blocked the main-frame load of failedUrl.
+    fun onBlocked(view: WebView, failedUrl: String)
+
+    // The main-frame load failed at the network level. Returns true when that was the active
+    // proxy failing and the load is being retried on the next rung, false to show the error page.
+    fun onConnectError(view: WebView, failedUrl: String): Boolean
+
+    fun openProxySettings()
 }
 
 // Ad/tracker/CMP-script domains blocked at the network layer, one level below the CSS
@@ -647,6 +712,7 @@ private fun createWebScreen(
     isNight: Boolean,
     onContentReady: () -> Unit,
     onCityUrl: (String) -> Unit,
+    proxyHooks: ProxyHooks,
 ): WebScreen {
     val context: Context = activity
     var webViewRef: WebView? = null
@@ -720,6 +786,10 @@ private fun createWebScreen(
                 request: WebResourceRequest,
             ): Boolean {
                 val target = request.url
+                if (target.toString() == PROXY_SETTINGS_URL) {
+                    proxyHooks.openProxySettings()
+                    return true
+                }
                 if (target.scheme == "http" || target.scheme == "https") return false
                 // Non-http(s) links (mailto:, tel:, intent:, ...) can't be loaded by the
                 // WebView itself; hand them to the system.
@@ -751,6 +821,7 @@ private fun createWebScreen(
                 // Subresources (ads, trackers) fail all the time -- only a failed main
                 // document warrants the error screen.
                 if (!request.isForMainFrame) return
+                if (proxyHooks.onConnectError(view, request.url.toString())) return
                 view.loadDataWithBaseURL(
                     null,
                     errorPageHtml(isNightMode(view.context), error.description.toString(), url),
@@ -758,6 +829,20 @@ private fun createWebScreen(
                     "utf-8",
                     null,
                 )
+            }
+
+            override fun onReceivedHttpError(
+                view: WebView,
+                request: WebResourceRequest,
+                errorResponse: WebResourceResponse,
+            ) {
+                super.onReceivedHttpError(view, request, errorResponse)
+                if (!isSiteBlock(request, errorResponse)) return
+                onContentReady()
+                val failedUrl = request.url.toString()
+                // Posted: replacing the load from inside the response callback of the very
+                // navigation being replaced is not something to rely on.
+                view.post { proxyHooks.onBlocked(view, failedUrl) }
             }
 
             // Fires when the WebView paints the first frame of actual page content -- the
@@ -849,9 +934,15 @@ private fun createWebScreen(
 // composition -> AppTheme -> Scaffold -> AndroidView factory) -- see
 // docs/startup-performance.md. A plain setContentView builds the WebView and starts
 // loadUrl immediately.
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), ProxyHooks {
 
     private var webView: WebView? = null
+
+    // Which proxy (or direct) the WebViews use, and what to switch to on a block. See
+    // ProxyRotation.kt. The override is process-wide, so it is applied once before the first
+    // load and again only when the rung changes.
+    private lateinit var proxyRotation: ProxyRotation
+    private var proxyApplied = false
 
     // Tracked so onConfigurationChanged can tell a real day/night flip apart from any
     // other config change -- uiMode's inclusion in android:configChanges routes every
@@ -891,6 +982,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         isNight = isNightMode(this)
         currentCityUrl = readCityUrl(this)
+        proxyRotation = WebViewProxy.load(this)
         installCurrentScreen()
 
         // Replaces Compose's BackHandler. canGoBack() is queried live on each press, so
@@ -932,6 +1024,7 @@ class MainActivity : ComponentActivity() {
             url = url,
             isNight = isNight,
             onContentReady = { contentReady = true },
+            proxyHooks = this,
             onCityUrl = { selectedUrl ->
                 if (selectedUrl != currentCityUrl) {
                     val cameFromSearch = currentCityUrl == null
@@ -967,10 +1060,105 @@ class MainActivity : ComponentActivity() {
             v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
             insets
         }
-        screen.webView.loadUrl(url)
+        if (proxyApplied || proxyRotation.activeRule == null) {
+            proxyApplied = true
+            screen.webView.loadUrl(url)
+        } else {
+            // A proxy that worked last time: point the WebView at it before the first
+            // request instead of hitting the block first.
+            proxyApplied = true
+            WebViewProxy.apply(this, proxyRotation) {
+                if (webView === screen.webView) screen.webView.loadUrl(url)
+            }
+        }
         // Destroyed only after setContentView has already detached it from the window --
         // WebView.destroy() expects to be called on a view no longer in the hierarchy.
         previous?.destroy()
+    }
+
+    override fun onBlocked(view: WebView, failedUrl: String) {
+        if (webView !== view) return
+        if (proxyRotation.onFailure(SystemClock.elapsedRealtime())) {
+            switchRungAndLoad(view, failedUrl)
+        } else {
+            view.loadDataWithBaseURL(
+                null,
+                blockedPageHtml(
+                    isNightMode(this),
+                    failedUrl,
+                    proxyRotation.proxies.size,
+                    WebViewProxy.isSupported,
+                ),
+                "text/html",
+                "utf-8",
+                null,
+            )
+        }
+    }
+
+    override fun onConnectError(view: WebView, failedUrl: String): Boolean {
+        // Direct and failing: a genuine network problem (offline, DNS), which no proxy fixes.
+        // A failing proxy is usually one that is only reachable on another network (e.g.
+        // inside a VPN tunnel that is now off), so moving on -- eventually to direct -- helps.
+        if (webView !== view || proxyRotation.activeRule == null) return false
+        if (!proxyRotation.onFailure(SystemClock.elapsedRealtime())) return false
+        switchRungAndLoad(view, failedUrl)
+        return true
+    }
+
+    private fun switchRungAndLoad(view: WebView, url: String) {
+        Log.i("Wetter", "site blocked or proxy failed; switching to rung ${proxyRotation.active}")
+        view.stopLoading()
+        WebViewProxy.saveActive(this, proxyRotation.active)
+        WebViewProxy.apply(this, proxyRotation) {
+            if (webView === view) view.loadUrl(url)
+        }
+    }
+
+    override fun openProxySettings() {
+        val pad = (16 * resources.displayMetrics.density).toInt()
+        val input = EditText(this).apply {
+            setText(WebViewProxy.listText(this@MainActivity))
+            hint = "socks5://proxy.example.org:1080"
+            minLines = 4
+            gravity = Gravity.TOP or Gravity.START
+            typeface = Typeface.MONOSPACE
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or InputType.TYPE_TEXT_VARIATION_URI
+        }
+        val container = FrameLayout(this).apply {
+            setPadding(pad, 0, pad, 0)
+            addView(input)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Proxies")
+            .setMessage(
+                "One per line: socks5://host:port or http://host:port. When kachelmannwetter.com " +
+                    "blocks the current network, the app switches to the next proxy and keeps " +
+                    "using the one that works. Leave empty to always connect directly.",
+            )
+            .setView(container)
+            .setPositiveButton("Save") { _, _ -> saveProxies(input.text.toString()) }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun saveProxies(text: String) {
+        WebViewProxy.saveList(this, text)
+        val invalid = ProxyList.invalidLines(text)
+        if (invalid.isNotEmpty()) {
+            Toast.makeText(this, "Ignored: ${invalid.joinToString(", ")}", Toast.LENGTH_LONG).show()
+        }
+        // Saving usually happens from the block page, i.e. direct is what just failed:
+        // start on the first proxy rather than retrying direct first.
+        val proxies = ProxyList.parse(text)
+        proxyRotation = ProxyRotation(proxies, if (proxies.isEmpty()) 0 else 1)
+        WebViewProxy.saveActive(this, proxyRotation.active)
+        val view = webView ?: return
+        val url = currentCityUrl ?: SEARCH_URL
+        WebViewProxy.apply(this, proxyRotation) {
+            if (webView === view) view.loadUrl(url)
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
