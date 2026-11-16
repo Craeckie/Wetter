@@ -1,0 +1,2 @@
+Access Denied handling: when kachelmannwetter.com blocks your network (VPN or datacenter IP), the app now switches to a proxy you configure and reloads, instead of showing the raw block page.
+If every option is blocked, an explanation page offers a retry and a proxy settings dialog.
